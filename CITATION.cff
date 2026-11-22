@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+title: "karpo-apple-silicon: Karpo Decision on Apple Silicon"
+message: "If you use this port, please cite it and MachinePulse's Karpo Decision models."
+type: software
+authors:
+  - name: "FluxCode Studio"
+repository-code: "https://github.com/fluxcodestudio/karpo-apple-silicon"
+license: Apache-2.0
+version: 0.1.0
+date-released: "2026-11-21"
+keywords:
+  - karpo-decision
+  - apple-silicon
+  - mps
+  - mlx
+  - gemma

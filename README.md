@@ -44,6 +44,23 @@ query `i` reads key `j` when `i + d - 1023 <= j <= i + d`. In words: each token 
 tokens before it, and when a question's branch reads the shared part of the request, the two are lined up at
 their ends.
 
+## Errors this fixes
+
+On a Mac, karpo-decision loads the checkpoint and then the first `decide()` call stops with one of these
+(the text comes from PyTorch):
+
+```text
+NotImplementedError: The operator 'aten::_flash_attention_forward' is not currently implemented for the MPS device.
+```
+
+```text
+NotImplementedError: Could not run 'aten::_flash_attention_forward' with arguments from the 'CPU' backend.
+```
+
+Setting `PYTORCH_ENABLE_MPS_FALLBACK=1`, as the first message suggests, does not help: the operator does not
+exist for the CPU either. The call comes from `karpo_decision.families.gemma.sliding_attention.attend`, which
+uses `torch.nn.attention.varlen.varlen_attn`. `karpo_apple_silicon.install()` replaces that call.
+
 ## Install
 
 You need a Mac with Apple Silicon, Python 3.12 or later, and enough memory for the weights: the 31B takes
@@ -262,6 +279,29 @@ They check the mask against a brute-force statement of the rule, the attention a
 per query (grouped key/value heads, several packed sequences of unequal length, half precision), the patch fed
 by karpo-decision's own plan against the rule stated by token position, and that a query with no key to read
 is an error rather than a silent wrong answer.
+
+## Questions people ask
+
+**Can I run Karpo Decision on a MacBook Pro, Mac Studio or Mac mini?** Yes, if it has Apple Silicon and enough
+memory: about 96 GB for the 31B as shipped, more than the 22 GB of weights for the 12B, and less for the 31B
+with the quantized MLX copies described above.
+
+**Does it work on Intel Macs?** It has not been tried. The patch itself runs on any device PyTorch supports,
+including the CPU, but a model this size on a CPU will be very slow.
+
+**Does it work on Linux or Windows without an NVIDIA GPU (CPU, AMD, Intel Arc)?** The patch is plain PyTorch
+and is not tied to macOS, so it should, but only Apple Silicon has been checked.
+
+**Is there a GGUF, llama.cpp or Ollama version?** Not here. This port keeps MachinePulse's own inference code,
+which Karpo Decision's answers depend on, and changes one function.
+
+**Are the answers the same as on an NVIDIA GPU?** Very nearly: see "What is verified, and how" for the
+measured differences and what was not checked.
+
+**Do I need flash-attn or xformers?** No. Neither is needed with this patch.
+
+**Which Karpo models does it cover?** `MachinePulseAI/karpo-decision-31B` and `MachinePulseAI/karpo-decision-12B`.
+The smaller Qwen-family Karpo models are not covered.
 
 ## Reporting a mismatch
 
