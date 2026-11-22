@@ -19,7 +19,7 @@ small patch on top and ships no weights.
 | Hardware | Apple Silicon Macs (M1, M2, M3, M4 and later), using the Metal GPU through PyTorch `mps` |
 | Also included | An experimental MLX path with 8-bit and 4-bit quantized weights, for Macs with less memory |
 | Not covered | The Qwen-family Karpo models (0.8B to 9B), images, and NVIDIA-only server features |
-| Weights | None shipped: you download them from Hugging Face |
+| Weights | None in this repository: the originals and ready-made MLX 8-bit and 4-bit copies are on Hugging Face |
 | Licence | Apache-2.0, free to use and change |
 
 **Does Karpo Decision run on a Mac?** Not as published: it needs an NVIDIA GPU. With this package it does.
@@ -218,8 +218,21 @@ on a compressed ("quantized") copy of the weights: about 32 GB at 8 bits, about 
 code than the patch above, it is newer, and it covers less: **text requests only, the 31B only**. Treat it as
 experimental.
 
+Ready-made copies are on Hugging Face, so you do not need the full 58 GB checkpoint to use this route:
+
+| Copy | Size | Download |
+|---|---|---|
+| 8-bit | about 32 GB | [jonnyArt/karpo-decision-31B-mlx-8bit](https://huggingface.co/jonnyArt/karpo-decision-31B-mlx-8bit) |
+| 4-bit | about 18 GB | [jonnyArt/karpo-decision-31B-mlx-4bit](https://huggingface.co/jonnyArt/karpo-decision-31B-mlx-4bit) |
+
 ```bash
 pip install "karpo-apple-silicon[mlx] @ git+https://github.com/fluxcodestudio/karpo-apple-silicon"
+hf download jonnyArt/karpo-decision-31B-mlx-8bit --local-dir karpo-decision-31B-mlx-8bit
+```
+
+Or convert your own copy from the full checkpoint:
+
+```bash
 python scripts/convert_mlx.py path/to/karpo-decision-31B path/to/karpo-decision-31B-mlx-8bit --bits 8
 ```
 
@@ -244,7 +257,8 @@ peaked at 24 GB for 8,000-token requests with the 4-bit copy (18 GB of weights);
 measured this way. The converter
 was checked against the folders used for these numbers on a sample of tensors, not re-run in full. The converted
 folder is a derivative of MachinePulse's weights: if you share one, keep their LICENSE and NOTICE with it.
-This repository ships no converted weights.
+This repository itself ships no weights; the converted copies linked above are hosted on Hugging Face with
+MachinePulse's LICENSE and NOTICE.
 
 ## Known limits
 
