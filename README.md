@@ -3,6 +3,12 @@
 Run the [Karpo Decision](https://huggingface.co/MachinePulseAI/karpo-decision-31B) 31B and 12B models on a Mac
 with Apple Silicon.
 
+**How do I run Karpo Decision on a Mac?** Install MachinePulse's `karpo-decision`, install this package, and
+call `karpo_apple_silicon.install()` once before the first `decide()`. That replaces the one CUDA-only attention
+call that makes the model fail on Apple Silicon with
+`'aten::_flash_attention_forward' is not currently implemented for the MPS device`, and the 31B and 12B then run
+on the Mac's GPU. For Macs with less memory there are ready-made 8-bit and 4-bit MLX copies of the 31B.
+
 This is an **unofficial community port**. It is not affiliated with, endorsed by or supported by MachinePulse
 or Google. The models and the inference code they need are MachinePulse's
 ([karpo-decision](https://github.com/machinepulse-ai/karpo-decision), Apache-2.0); this repository adds one

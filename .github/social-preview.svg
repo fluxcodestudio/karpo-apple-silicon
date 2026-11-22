@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <rect width="1280" height="640" fill="#0f172a"/>
+  <rect x="0" y="0" width="16" height="640" fill="#ea580c"/>
+  <text x="96" y="210" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="88" font-weight="700" fill="#f8fafc">karpo-apple-silicon</text>
+  <text x="96" y="296" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="44" fill="#cbd5e1">Run Karpo Decision 31B and 12B on a Mac</text>
+  <text x="96" y="392" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="34" fill="#94a3b8">PyTorch MPS patch  ·  MLX 8-bit and 4-bit weights</text>
+  <text x="96" y="446" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="34" fill="#94a3b8">Checked against the published 31B results</text>
+  <text x="96" y="560" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="30" fill="#ea580c">Unofficial community port  ·  Apache-2.0  ·  FluxCode Studio</text>
+</svg>
