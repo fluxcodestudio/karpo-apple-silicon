@@ -1,4 +1,4 @@
-# Copyright 2026 the karpo-apple-silicon contributors
+# Copyright 2026 FluxCode Studio and the karpo-apple-silicon contributors
 # SPDX-License-Identifier: Apache-2.0
 """Write a quantized MLX copy of a Karpo Decision 31B checkpoint's text layers (experimental).
 

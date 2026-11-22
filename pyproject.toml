@@ -7,6 +7,7 @@ name = "karpo-apple-silicon"
 version = "0.1.0"
 description = "Unofficial port that lets the Karpo Decision models (Gemma family) run on Apple Silicon"
 readme = "README.md"
+authors = [{name = "FluxCode Studio"}]
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.12"

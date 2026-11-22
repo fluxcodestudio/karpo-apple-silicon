@@ -1,4 +1,4 @@
-# Copyright 2026 the karpo-apple-silicon contributors
+# Copyright 2026 FluxCode Studio and the karpo-apple-silicon contributors
 # SPDX-License-Identifier: Apache-2.0
 """Answer one request on a Mac.
 

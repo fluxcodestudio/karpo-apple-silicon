@@ -1,4 +1,4 @@
-# Copyright 2026 the karpo-apple-silicon contributors
+# Copyright 2026 FluxCode Studio and the karpo-apple-silicon contributors
 # SPDX-License-Identifier: Apache-2.0
 """The MLX path's masks and rotary frequencies. Needs mlx, mlx-lm and karpo-decision; no weights."""
 

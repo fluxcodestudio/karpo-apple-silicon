@@ -329,7 +329,8 @@ above, please open an issue here (not on MachinePulse's repository; they did not
 
 ## Licence and credit
 
-The code in this repository is licensed under the [Apache License, Version 2.0](LICENSE); see [NOTICE](NOTICE).
+This port is maintained by FluxCode Studio. The code in this repository is licensed under the
+[Apache License, Version 2.0](LICENSE); see [NOTICE](NOTICE).
 
 Karpo Decision, its weights and its inference code are the work of MachinePulse (Copyright 2026 MachinePulse
 Pte. Ltd., Apache-2.0). karpo-decision-31B and karpo-decision-12B are modified versions of Google DeepMind's
