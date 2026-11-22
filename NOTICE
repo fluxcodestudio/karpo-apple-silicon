@@ -1,0 +1,27 @@
+karpo-apple-silicon
+Copyright 2026 the karpo-apple-silicon contributors
+
+An unofficial community port that lets the Karpo Decision models run on Apple Silicon.
+It is not affiliated with, endorsed by or supported by MachinePulse or Google.
+
+This software is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It works with, and takes its attention rule and function signatures from,
+karpo-decision (https://github.com/machinepulse-ai/karpo-decision),
+Copyright 2026 MachinePulse Pte. Ltd., licensed under the Apache License, Version 2.0.
+karpo-decision is not included here; it is installed separately.
+karpo_apple_silicon/mlx.py calls karpo-decision's encoder and block plan and re-expresses
+its Gemma 4 layer computation for MLX.
+
+No model weights are included. The Karpo Decision weights
+(https://huggingface.co/MachinePulseAI) are Copyright 2026 MachinePulse Pte. Ltd. and
+licensed under the Apache License, Version 2.0. karpo-decision-31B and karpo-decision-12B
+are modified versions of Gemma 4 (google/gemma-4-31B-it, google/gemma-4-12B-it), developed
+by Google DeepMind and licensed under the Apache License, Version 2.0. Their own LICENSE
+and NOTICE files apply to them and to anything converted from them.
+
+Tested with karpo-decision 0.1.0 (commit 6600011eb5cf), torch 2.15.0, transformers 5.23.0, and for the MLX path
+mlx 0.32.4 and mlx-lm 0.32.2.
+
+Powered by karpo-decision (MachinePulse)
+https://huggingface.co/MachinePulseAI/karpo-decision-31B

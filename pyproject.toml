@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "karpo-apple-silicon"
+version = "0.1.0"
+description = "Unofficial port that lets the Karpo Decision models (Gemma family) run on Apple Silicon"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12"
+dependencies = ["torch>=2.15"]
+keywords = [
+    "karpo", "karpo-decision", "karpo-decision-31B", "karpo-decision-12B", "machinepulse",
+    "apple-silicon", "macos", "mac", "mps", "metal", "mlx", "pytorch", "gemma", "gemma-4",
+    "decision-model", "sliding-window-attention", "flash-attention", "quantization",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/fluxcodestudio/karpo-apple-silicon"
+Issues = "https://github.com/fluxcodestudio/karpo-apple-silicon/issues"
+"Karpo Decision (upstream)" = "https://github.com/machinepulse-ai/karpo-decision"
+"Karpo Decision 31B weights" = "https://huggingface.co/MachinePulseAI/karpo-decision-31B"
+"Karpo Decision 12B weights" = "https://huggingface.co/MachinePulseAI/karpo-decision-12B"
+
+[project.optional-dependencies]
+mlx = ["mlx>=0.32", "mlx-lm>=0.32"]
+
+[tool.setuptools]
+packages = ["karpo_apple_silicon"]

@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.DS_Store
+
+# never commit weights, converted weights, benchmark rows or per-request results
+*.safetensors
+*.gguf
+*.npz
+*.bin
+*.jsonl
+*.jsonl.gz
+*.parquet
+work/
+runs/
