@@ -47,5 +47,5 @@ question = {"type": "choice", "instructions": "Which team should handle this mes
             "criteria": {"returns": "Damaged or faulty goods", "billing": "Payments and charges",
                          "sales": "Questions before buying"}}
 responses = decider.decide([{"state": ticket, "questions": {"team": question}} for ticket in tickets])
-for ticket, response in zip(tickets, responses):
+for ticket, response in zip(tickets, responses, strict=True):
     print(response["answers"]["team"]["choice"], "<-", ticket)

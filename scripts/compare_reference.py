@@ -27,6 +27,7 @@ start again, and always after changing the code or the checkpoint.
   window-1    wrong on purpose: one key fewer in the window
   float16     the port with the backbone converted to float16 (run it last: the conversion is not undone)
 The wrong-on-purpose passes show how large a difference this comparison would report for a wrong mask.
+They use the dense reference with a full-sequence mask, not the shipped chunked function.
 """
 
 from __future__ import annotations
@@ -38,11 +39,13 @@ import json
 import statistics
 import time
 from collections import defaultdict
+from functools import partial
 from pathlib import Path
 
 import torch
 
 import karpo_apple_silicon
+from karpo_apple_silicon.reference import dense_attend, wrong_no_window, wrong_top_left, wrong_window_minus_one
 
 VARIANTS = ("port", "no-window", "top-left", "window-1", "float16")
 CELLS = ("single-short", "single-long", "multi-short", "multi-long")
@@ -111,19 +114,16 @@ def top(answer) -> str:
 
 
 def set_variant(name: str, decider) -> None:
-    original = karpo_apple_silicon._original_window_mask
+    from karpo_decision.families.gemma import sliding_attention
+
     if name in ("port", "float16"):
-        karpo_apple_silicon.window_mask = original
+        sliding_attention.attend = karpo_apple_silicon.attend
     elif name == "no-window":
-        karpo_apple_silicon.window_mask = lambda lq, lk, window, device="cpu": original(lq, lk, lq + lk, device)
+        sliding_attention.attend = partial(dense_attend, mask=wrong_no_window)
     elif name == "window-1":
-        karpo_apple_silicon.window_mask = lambda lq, lk, window, device="cpu": original(lq, lk, window - 1, device)
+        sliding_attention.attend = partial(dense_attend, mask=wrong_window_minus_one)
     elif name == "top-left":
-        def top_left(lq, lk, window, device="cpu"):
-            i = torch.arange(lq, device=device)[:, None]
-            j = torch.arange(lk, device=device)[None, :]
-            return (j <= i) & (j >= i - window)
-        karpo_apple_silicon.window_mask = top_left
+        sliding_attention.attend = partial(dense_attend, mask=wrong_top_left)
     if name == "float16":
         decider.ckpt.backbone.to(torch.float16)
 
@@ -234,7 +234,6 @@ def main() -> None:
     else:
         from karpo_decision.decider import Decider
 
-        karpo_apple_silicon._original_window_mask = karpo_apple_silicon.window_mask
         karpo_apple_silicon.install()
         synchronize = torch.mps.synchronize if torch.device(args.device).type == "mps" else (lambda: None)
         decider = Decider.from_pretrained(args.checkpoint, device=args.device)
