@@ -1,0 +1,33 @@
+# Copyright 2026 FluxCode Studio and the karpo-apple-silicon contributors
+# SPDX-License-Identifier: Apache-2.0
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    strategy:
+      matrix:
+        os: [macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: machinepulse-ai/karpo-decision
+          ref: 6600011eb5cf46232d056ec0717dc726146d29de
+          path: upstream
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - if: runner.os == 'Linux'
+        run: python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      - if: runner.os == 'macOS'
+        run: python -m pip install torch
+      - run: python -m pip install -e ./upstream -e '.[dev]'
+        if: runner.os == 'Linux'
+      - run: python -m pip install -e ./upstream -e '.[dev,mlx]'
+        if: runner.os == 'macOS'
+      - run: python -m ruff check .
+      - run: python -m unittest discover -s tests -v
+      - run: python scripts/check_upstream_suite.py upstream

@@ -6,6 +6,13 @@ dist/
 .venv/
 venv/
 .DS_Store
+.ruff_cache/
+.pytest_cache/
+.worktrees/
+*.pt
+*.npy
+comparison*.json
+karpo-decision-*/
 
 # never commit weights, converted weights, benchmark rows or per-request results
 *.safetensors
