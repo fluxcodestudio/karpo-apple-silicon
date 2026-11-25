@@ -20,8 +20,8 @@ are modified versions of Gemma 4 (google/gemma-4-31B-it, google/gemma-4-12B-it),
 by Google DeepMind and licensed under the Apache License, Version 2.0. Their own LICENSE
 and NOTICE files apply to them and to anything converted from them.
 
-Tested with karpo-decision 0.1.0 (commit 6600011eb5cf), torch 2.15.0, transformers 5.23.0, and for the MLX path
-mlx 0.32.4 and mlx-lm 0.32.2.
+Tested with karpo-decision 0.1.0 (commits 6600011eb5cf and c52d3507a254), torch 2.15.0, transformers 5.23.0, and
+for the MLX path mlx 0.32.4 and mlx-lm 0.32.2.
 
 Powered by karpo-decision (MachinePulse)
 https://huggingface.co/MachinePulseAI/karpo-decision-31B

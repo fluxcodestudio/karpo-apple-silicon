@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PINNED_COMMIT = "6600011eb5cf46232d056ec0717dc726146d29de"
+PINNED_COMMIT = "c52d3507a254d3ad8423726c6bc6568c99113e7d"
 VARIANTS = ("port", "top-left", "window-1", "window+1", "no-window")
 TESTS = ("tests/test_gemma_blocks.py", "tests/test_gemma_padded.py", "tests/test_gemma_images.py")
 

@@ -17,6 +17,8 @@ All notable changes to this project are documented here.
 - On the real 31B on a 96 GB MacBook Pro, 0.2.0 answers nine requests of up to 10,196 tokens in bfloat16 and in
   float16, and gives the same top answers as 0.1.0 on the eight requests both ran.
 - The installer checks the recorded upstream commit and the original attention signature.
+- Pinned to karpo-decision commit c52d3507a254, upstream's newest. Commit 6600011eb5cf, which has the same
+  source files, is still accepted without a warning.
 - Corrected the documentation on memory sizes, test coverage and measured speed.
 - MLX `load()` accepts `max_length`; `decide()` accepts one request or a list, and `decide_many()` remains.
 - MLX attention reads reachable keys in chunks of 256 query rows; the last layer runs only on marker rows. On

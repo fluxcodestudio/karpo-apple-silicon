@@ -9,7 +9,7 @@ Karpo Decision as published needs an NVIDIA GPU. On a Mac the checkpoint loads, 
 ## Install and use
 
 ```bash
-pip install "karpo-decision @ git+https://github.com/machinepulse-ai/karpo-decision@6600011eb5cf46232d056ec0717dc726146d29de"
+pip install "karpo-decision @ git+https://github.com/machinepulse-ai/karpo-decision@c52d3507a254d3ad8423726c6bc6568c99113e7d"
 pip install "karpo-apple-silicon @ git+https://github.com/fluxcodestudio/karpo-apple-silicon"
 ```
 
@@ -27,7 +27,7 @@ decider = Decider.from_pretrained("path/to/karpo-decision-31B", device="mps")
 - Ready-made MLX weights: https://huggingface.co/jonnyArt/karpo-decision-31B-mlx-8bit and https://huggingface.co/jonnyArt/karpo-decision-31B-mlx-4bit
 - Accuracy against MachinePulse's published 31B results (340 requests, 1,606 questions): PyTorch on MPS changed 1 top answer (mean difference 0.0011); version 0.1.0 MLX 8-bit changed 2 (0.0016); version 0.1.0 MLX 4-bit changed 3 of 681 (0.0067). The reworked MLX loader and forward pass (version 0.2.0) have been checked on small random models, and both published folders have the required tensor names and shapes. On the real 4-bit weights version 0.2.0 gave the same top answer as version 0.1.0 on 71 questions (largest probability difference 0.061) with lower peak memory on long requests (23.3 GB to 20.9 GB at 7,464 tokens) and no measurable change in time; on the real 8-bit weights it likewise gave the same top answers on those 71 questions (largest difference 0.040), peaking at 35.6 GB instead of 40.4 GB at 10,196 tokens. On the real 31B in bfloat16, version 0.2.0 gave the same top answers as version 0.1.0 on 31 questions of invented requests (28 of them near-certain; largest probability difference 0.037), and the same top answers as the MLX copies on 71 questions (66 near-certain; largest difference 0.052 for the 8-bit copy and 0.159 for the 4-bit one); converted to float16 it gave the same 71 top answers as in bfloat16 (largest difference 0.028).
 - Not covered or not checked: the Qwen-family Karpo models (0.8B to 9B and 27B-act), images, requests longer than 10,196 tokens, comparison with the published results beyond 8,072 tokens or for the 12B (no per-request results are published for it), GGUF / llama.cpp / Ollama. AMD and Intel GPUs have not been checked.
-- Port version 0.2.0; tested with karpo-decision 0.1.0 (commit 6600011eb5cf), torch 2.15.0, transformers 5.23.0, mlx 0.32.4, mlx-lm 0.32.2. The installer compares pip's recorded upstream commit because the upstream version has not changed between commits, and checks the attention signature.
+- Port version 0.2.0; tested with karpo-decision 0.1.0 (commits 6600011eb5cf and c52d3507a254, which have the same source files), torch 2.15.0, transformers 5.23.0, mlx 0.32.4, mlx-lm 0.32.2. The installer compares pip's recorded upstream commit because the upstream version has not changed between commits, and checks the attention signature.
 
 ## Links
 

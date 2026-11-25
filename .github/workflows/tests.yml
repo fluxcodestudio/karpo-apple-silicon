@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: machinepulse-ai/karpo-decision
-          ref: 6600011eb5cf46232d056ec0717dc726146d29de
+          ref: c52d3507a254d3ad8423726c6bc6568c99113e7d
           path: upstream
       - uses: actions/setup-python@v5
         with:

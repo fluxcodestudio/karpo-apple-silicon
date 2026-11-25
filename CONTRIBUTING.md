@@ -7,7 +7,7 @@ git clone https://github.com/fluxcodestudio/karpo-apple-silicon
 cd karpo-apple-silicon
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install "karpo-decision @ git+https://github.com/machinepulse-ai/karpo-decision@6600011eb5cf46232d056ec0717dc726146d29de"
+pip install "karpo-decision @ git+https://github.com/machinepulse-ai/karpo-decision@c52d3507a254d3ad8423726c6bc6568c99113e7d"
 pip install -e ".[dev,mlx]"
 ```
 

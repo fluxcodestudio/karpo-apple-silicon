@@ -45,9 +45,13 @@ __all__ = ["CHUNK", "TESTED_UPSTREAM", "attend", "install", "uninstall", "window
 #: The karpo-decision release this was written against and checked with.
 TESTED_UPSTREAM = "0.1.0"
 
-#: The karpo-decision commit the rule was read from and the tests were run against. Upstream's version
-#: has been 0.1.0 at every commit so far, so the commit is what ``install()`` compares when pip recorded one.
-TESTED_UPSTREAM_COMMIT = "6600011eb5cf46232d056ec0717dc726146d29de"
+#: The karpo-decision commits this was checked with, newest first. Upstream's version has been 0.1.0 at every
+#: commit so far, so the commit is what ``install()`` compares when pip recorded one. The two have the same
+#: source files: the newer one changes only licence and Docker text.
+TESTED_UPSTREAM_COMMITS = ("c52d3507a254d3ad8423726c6bc6568c99113e7d", "6600011eb5cf46232d056ec0717dc726146d29de")
+
+#: The commit the install instructions name.
+TESTED_UPSTREAM_COMMIT = TESTED_UPSTREAM_COMMITS[0]
 
 #: Queries answered per attention call. A chunk reads at most ``CHUNK + window`` keys, where one call per
 #: sequence would read them all. On Apple GPUs, times were flat from 128 to 256 and worse at 64 and 512.
@@ -139,7 +143,7 @@ def install(force: bool = False) -> None:
     faster, so nothing is changed there unless ``force`` is true (useful for comparing the two); kernel
     selection is never changed there. Calling it again changes nothing.
 
-    Warns when karpo-decision is not the commit this was checked with, and raises ``RuntimeError`` when
+    Warns when karpo-decision is not a commit this was checked with, and raises ``RuntimeError`` when
     its ``attend`` no longer takes the arguments this replacement was written for.
     """
     try:
@@ -157,7 +161,7 @@ def install(force: bool = False) -> None:
     except PackageNotFoundError:  # a source tree not installed as a distribution: no version to compare
         found = None
     commit = _installed_commit()
-    if commit is not None and commit != TESTED_UPSTREAM_COMMIT:
+    if commit is not None and commit not in TESTED_UPSTREAM_COMMITS:
         warnings.warn(f"karpo-apple-silicon was checked against karpo-decision commit "
                       f"{TESTED_UPSTREAM_COMMIT[:12]}; {commit[:12]} is installed and its attention rule may differ.",
                       stacklevel=2)

@@ -87,12 +87,14 @@ the 31B takes 62.6 GB (so a 96 GB or larger Mac in practice), the 12B 24.0 GB.
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install "karpo-decision @ git+https://github.com/machinepulse-ai/karpo-decision@6600011eb5cf46232d056ec0717dc726146d29de"
+pip install "karpo-decision @ git+https://github.com/machinepulse-ai/karpo-decision@c52d3507a254d3ad8423726c6bc6568c99113e7d"
 pip install "karpo-apple-silicon @ git+https://github.com/fluxcodestudio/karpo-apple-silicon"
 ```
 
-The third line installs the exact karpo-decision commit this port was checked with (version 0.1.0). A newer
-one may work, but has not been checked.
+The third line installs the newest karpo-decision commit this port was checked with (version 0.1.0). The
+measurements in this README were made at commit 6600011eb5cf; the pinned commit follows it and changes only
+licence and Docker text, so the two have the same source files, and upstream's tests pass against this port at
+both. A newer one may work, but has not been checked.
 
 To run the example, benchmark, tests or converter from this repository, clone it and install it in editable mode
 instead of the second `pip install` line above:
@@ -368,7 +370,7 @@ Ready-made copies are on Hugging Face, so you do not need the full 62.6 GB check
 | 4-bit | 19.3 GB | [jonnyArt/karpo-decision-31B-mlx-4bit](https://huggingface.co/jonnyArt/karpo-decision-31B-mlx-4bit) |
 
 ```bash
-pip install "karpo-decision @ git+https://github.com/machinepulse-ai/karpo-decision@6600011eb5cf46232d056ec0717dc726146d29de"
+pip install "karpo-decision @ git+https://github.com/machinepulse-ai/karpo-decision@c52d3507a254d3ad8423726c6bc6568c99113e7d"
 pip install "karpo-apple-silicon[mlx] @ git+https://github.com/fluxcodestudio/karpo-apple-silicon"
 hf download jonnyArt/karpo-decision-31B-mlx-8bit --local-dir karpo-decision-31B-mlx-8bit
 ```
@@ -488,8 +490,8 @@ MachinePulse's LICENSE and NOTICE.
   requests (the model accepts up to 32,768 tokens) may run out of memory or be very slow. On a 96 GB Mac the
   31B took four minutes for a 7,464-token request as shipped and under three in float16 (see Speed).
 - **Slower than an NVIDIA GPU**, by roughly ten to twenty times (see Speed).
-- **Tied to the pinned karpo-decision commit.** `install()` warns when pip records a different git commit, or
-  when no commit is recorded and the version differs from 0.1.0. It rejects an incompatible `attend` signature.
+- **Tied to the pinned karpo-decision commit.** `install()` warns when pip records a git commit other than the
+  two it was checked with, or when no commit is recorded and the version differs from 0.1.0. It rejects an incompatible `attend` signature.
   Upstream's version has not changed between commits so far, which is why the commit is compared.
 - **Small differences from the published numbers are expected.** Different hardware adds up numbers in a
   different order. Here probabilities differed by 0.001 on average, and by 0.03 to 0.10 in a handful of
@@ -574,5 +576,5 @@ Pte. Ltd., Apache-2.0). karpo-decision-31B and karpo-decision-12B are modified v
 Gemma 4 (Apache-2.0). This port only makes their code run on different hardware; the model's quality, and any
 credit for it, is theirs.
 
-Tested with karpo-decision 0.1.0 (commit 6600011eb5cf), torch 2.15.0 and transformers 5.23.0; the MLX path with mlx 0.32.4 and
-mlx-lm 0.32.2.
+Tested with karpo-decision 0.1.0 (commits 6600011eb5cf and c52d3507a254), torch 2.15.0 and transformers
+5.23.0; the MLX path with mlx 0.32.4 and mlx-lm 0.32.2.

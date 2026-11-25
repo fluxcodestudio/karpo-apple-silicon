@@ -286,7 +286,9 @@ class AgainstUpstreamPlan(unittest.TestCase):
         self.assertIsNot(packed.sdpa_kernel, original_kernel)
 
     def test_commit_warning_and_matching_commit(self):
-        for commit, expected in (("abcdef0123456789", True), (karpo_apple_silicon.TESTED_UPSTREAM_COMMIT, False)):
+        checked = karpo_apple_silicon.TESTED_UPSTREAM_COMMITS
+        self.assertEqual(checked[0], karpo_apple_silicon.TESTED_UPSTREAM_COMMIT)  # the one the instructions name
+        for commit, expected in (("abcdef0123456789", True), *((commit, False) for commit in checked)):
             with self.subTest(commit=commit), \
                  patch.object(karpo_apple_silicon, "_installed_commit", return_value=commit):
                 with warnings.catch_warnings(record=True) as caught:
