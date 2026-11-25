@@ -224,8 +224,50 @@ Where the time goes inside the 7,464-token request, measured by draining the GPU
 The sliding-window attention itself became about four times faster, but with 0.2.0 it is under a tenth of a
 long request; the rest is karpo-decision's and PyTorch's own code, which this port does not change. At 1,949
 tokens the sliding-window attention was 11 to 12% of the request with 0.1.0 and is 7 to 8% with 0.2.0.
-Converting to float16, above, does more for speed than this change. The 31B has not been timed end to end with
-0.2.0, and the per-request table at the top of this section was measured with 0.1.0.
+Converting to float16, above, does more for speed than this change. The per-request table at the top of this
+section was measured with 0.1.0.
+
+### The 31B on a 96 GB Mac (version 0.2.0)
+
+The 31B was run with version 0.2.0 on a MacBook Pro (M2 Max, 38-core GPU, 96 GB) with most other apps closed:
+once as shipped (bfloat16) and once converted to float16, which took 15 seconds. It loaded in about 115
+seconds, with the files already in the disk cache, and held about 60 GB on the GPU. In each session swap in
+use grew from 9 or 10 GB with the model loaded to 23 or 24 GB by the end; roughly 9 to 20 GB was available
+after each request up to 4,574 tokens, and 6 or 7 GB after the longest. Memory here and in the MLX section is
+in the units macOS reports it in (1 GB is 2^30 bytes, so the 62.6 GB checkpoint is 58.3 GB of memory). Seconds
+per request, one run of each: a rough guide, not a measurement. The Mac was also indexing and copying files, more so in the
+bfloat16 session (load average about 20) than in the float16 one (about 9). The first request of each session,
+the 249-token example, is left out as a warm-up.
+
+| Request | Tokens | bfloat16 | float16 |
+|---|---:|---:|---:|
+| 1 question | 414 | 5.1 | 3.0 |
+| 1 question | 1,049 | 11.9 | 6.8 |
+| 1 question | 1,949 | 22.0 | 12.3 |
+| 12 questions | 2,910 | 34.0 | 19.8 |
+| 1 question | 3,767 | 54.9 | 25.5 |
+| 12 questions | 4,574 | 80.3 | 31.4 |
+| 1 question | 7,464 | 240 | 159 |
+| 40 questions | 10,196 | 370 | 287 |
+
+- **It works, and short requests are practical.** All 71 questions of the nine requests were answered in both
+  precisions. Up to about 2,000 tokens the 31B took 2.3 to 2.8 times as long as the 12B does on the same Mac
+  (the table above).
+- **Long requests are slow on 96 GB.** At 7,464 tokens the 31B took seven times as long as the 12B in both
+  precisions. Running short of memory is the likely reason; this was not isolated by measurement. On this Mac
+  the quantized MLX copies below answered the same request in 79 seconds (8-bit, one run) and in 71 to 122
+  seconds (4-bit, six runs).
+- **float16 gives the same top answers, faster.** All 71 top answers matched bfloat16; the largest difference in
+  a probability was 0.028 and none exceeded 0.05. The single runs were 1.7 to 2.6 times as fast up to 4,574
+  tokens and 1.3 to 1.5 times at the two longest. The float16 session was also the quieter one, so part of that
+  is the machine.
+- **Same top answers as 0.1.0.** In the bfloat16 session version 0.1.0 was run after 0.2.0 on each of the first
+  eight requests (31 questions): no top answer differed. Only three of those answers were not near-certain (a top probability
+  below 0.98); they were in the 4,574-token request, where the largest difference in a probability was 0.037.
+  In the other seven requests it was 0.00003 or less. For the 10,196-token request the run script's memory
+  check skipped 0.1.0, so it was not tried.
+- **The two versions were not timed against each other here**: one run each, always in the same order. The
+  alternated comparison is the 12B table above.
 
 ## What is verified, and how
 
@@ -257,8 +299,10 @@ published one and drops rows that differ; it compares token counts after running
 
 This comparison used 0.1.0's full-table attention. Version 0.2.0's banded attention is tested against that
 implementation (kept as `karpo_apple_silicon.reference.dense_attend`) and agrees to rounding: 1e-12 in float64
-and one unit in the last place in half precision on random tensors. The published-results comparison has not
-been re-run with 0.2.0.
+and one unit in the last place in half precision on random tensors on the Apple GPU. The published-results
+comparison has not been re-run with 0.2.0. On the real 31B the two versions gave the same top answer on all 31
+questions of eight invented requests, 28 of which were near-certain either way (see "The 31B on a 96 GB Mac"
+under Speed); that is a much smaller check than the comparison above.
 
 | 31B on the Mac, against the published NVIDIA results | Questions | Top answer changed | Mean difference | Largest difference |
 |---|---:|---:|---:|---:|
@@ -388,9 +432,27 @@ was in use.
   0.2.0 and 98 to 123 seconds over four runs of version 0.1.0; that spread is the machine's other work, since
   the same code in the same process gave both ends of it. Most of a layer's time is its quantized projections,
   not its attention.
+- **Against the full checkpoint.** The full bfloat16 31B, run through the PyTorch route with version 0.2.0 on
+  the same Mac, gave the same top answer on all 71 questions, 66 of which it answered with a top probability of
+  0.98 or more. The largest difference in a probability was 0.159 (mean 0.009); five answers differed by more
+  than 0.05, all in the 10,196-token request with 40 questions.
 
-The 8-bit copy has not been run with version 0.2.0, and the comparison with MachinePulse's published results
-below has not been repeated. The MLX timings in the Speed table were measured with version 0.1.0.
+The published 8-bit copy was run the same way on the same Mac, one run of each version (0.2.0 first), with a
+load average of 5 to 10:
+
+- **Answers.** No top answer changed between the versions on the 71 questions. Three answers differed by more
+  than 0.01 and the largest difference was 0.040 (mean 0.001).
+- **Memory.** The peak fell from 40.4 GB to 35.6 GB for the 10,196-token request and from 37.0 GB to 34.5 GB
+  for the 7,464-token one. Below about 3,000 tokens it is unchanged (32 to 33 GB; the weights take 31.6 GB).
+- **Against the full checkpoint.** The same top answer on all 71 questions. The largest difference in a
+  probability was 0.052 (mean 0.002), the only one over 0.05; the 4-bit copy's were 0.159 and 0.009, with five
+  over 0.05.
+- **Time.** With version 0.2.0 the 1,049-token request took 9.1 seconds, the 7,464-token one 79 and the
+  10,196-token one 132. Version 0.1.0, run afterwards, took 11.4, 104 and 155; one run of each in one order is
+  not a comparison (for the 4-bit copy, alternated runs showed no difference).
+
+The comparison with MachinePulse's published results below has not been repeated with version 0.2.0. The MLX
+timings in the Speed table were measured with version 0.1.0.
 
 The version 0.1.0 MLX comparison against MachinePulse's published results:
 
@@ -416,14 +478,15 @@ MachinePulse's LICENSE and NOTICE.
 - **Text requests only have been run.** Requests with images go through code this patch does not change and
   that looks device-independent, but no image request has been run on a Mac. Treat images as untested.
 - **The MLX route is text-only.** It refuses image requests and does not convert or run the vision tower. Its
-  reworked loader and forward pass have been run with the real 4-bit weights, not with the 8-bit ones.
+  reworked loader and forward pass have been run with the real 4-bit and 8-bit weights.
 - **PyTorch inference with `Decider.decide` only.** karpo-decision's server, its FP8 and CUDA-graph fast paths, its
   Triton attention and anything to do with training are NVIDIA-only or untested here.
 - **Memory still grows with the square of the request length.** Sliding-window layers no longer build a full
   table; their cost grows with length times the window. The model's global layers (10 of the 31B's 60, 8 of
   the 12B's 48) are upstream's own code and read the whole request, so quadratic memory remains in fewer layers.
-  The longest request run here was 8,072 tokens; very long requests (the model accepts up to 32,768 tokens)
-  may run out of memory or be very slow.
+  The longest request run here was 10,196 tokens (8,072 in the published-results comparison); very long
+  requests (the model accepts up to 32,768 tokens) may run out of memory or be very slow. On a 96 GB Mac the
+  31B took four minutes for a 7,464-token request as shipped and under three in float16 (see Speed).
 - **Slower than an NVIDIA GPU**, by roughly ten to twenty times (see Speed).
 - **Tied to the pinned karpo-decision commit.** `install()` warns when pip records a different git commit, or
   when no commit is recorded and the version differs from 0.1.0. It rejects an incompatible `attend` signature.
