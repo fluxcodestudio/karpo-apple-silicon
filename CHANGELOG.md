@@ -23,7 +23,8 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
-- CPU forward now works by lifting the CUDA-only kernel selection in upstream's global layers.
+- CPU forward now works by lifting the CUDA-only kernel selection in upstream's global layers. On the real 12B,
+  0.1.0 stopped on CPU and 0.2.0 matches the Apple GPU's answers.
 - MLX loads refuse incomplete, altered or unreadable text weights instead of leaving a partial model.
 - MLX conversion checks source names first and completes a validated partial folder before renaming it.
 

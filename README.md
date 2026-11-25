@@ -75,8 +75,9 @@ RuntimeError: No viable backend for scaled_dot_product_attention was found.
 Setting `PYTORCH_ENABLE_MPS_FALLBACK=1`, as the first message suggests, does not help: the operator does not
 exist for the CPU either. The call comes from `karpo_decision.families.gemma.sliding_attention.attend`, which
 uses `torch.nn.attention.varlen.varlen_attn`. `karpo_apple_silicon.install()` replaces that call and, without
-CUDA, lifts the global layers' kernel restriction. A tiny random model has been checked on CPU; no real checkpoint
-has been run on CPU.
+CUDA, lifts the global layers' kernel restriction. On CPU the real 12B was run on an Apple Silicon Mac: with
+version 0.1.0 it stopped with the last error above; with version 0.2.0 it gave the same top answers as on the
+Apple GPU, with probabilities within 0.00003, for a 249-token and a 1,049-token request.
 
 ## Install
 
@@ -145,6 +146,11 @@ The request and response formats are karpo-decision's own; see its README. A com
 2. **Batches.** Pass a list of requests to `decide()` instead of calling it once per request. karpo-decision
    packs them into shared forward passes.
 
+On CPU (`device="cpu"`), convert to float32 instead, with `decider.ckpt.backbone.to(torch.float32)`: bfloat16
+is far slower there, and float32 takes twice the memory (48 GB for the 12B). On an M2 Max a 1,049-token request
+to the 12B took 14 seconds in float32 on eight threads and 250 seconds in bfloat16 on four; the answers differed
+by 0.00002 at most.
+
 ## Speed
 
 Measured with version 0.1.0 on one machine: a Mac Studio, M2 Ultra, 192 GB. **The machine was busy with other jobs during every
@@ -186,39 +192,40 @@ about 10), median of 5:
 | 31B shape, float16, 206 tokens | 3 ms | 3 ms |
 
 End to end the gain is much smaller, because most of a request's time is spent elsewhere. The real 12B, one
-request at a time, on a MacBook Pro (M2 Max, 38-core GPU, 96 GB): seconds per request, the fastest of 3 runs of
-each version, taken in alternation.
+request at a time, on a MacBook Pro (M2 Max, 38-core GPU, 96 GB): seconds per request, the fastest of 6 runs of
+each version, taken in alternation in two sessions of 3.
 
 | Request | Tokens | bfloat16, 0.1.0 | bfloat16, 0.2.0 | float16, 0.1.0 | float16, 0.2.0 |
 |---|---:|---:|---:|---:|---:|
-| The example under Use, 2 questions | 249 | 1.18 | 1.20 | 0.69 | 0.69 |
-| 1 question | 1,049 | 4.62 | 4.57 | 2.97 | 2.84 |
-| 1 question | 1,949 | 8.81 | 8.39 | 5.75 | 5.45 |
-| 1 question | 3,767 | 19.1 | 17.9 | 11.8 | 10.4 |
-| 1 question | 7,464 | 51.9 | 41.1 | 29.4 | 22.9 |
-| 40 questions | 10,196 | 61.6 | 50.7 | 38.5 | 35.8 |
+| The example under Use, 2 questions | 249 | 1.18 | 1.13 | 0.69 | 0.69 |
+| 1 question | 1,049 | 4.36 | 4.31 | 2.97 | 2.84 |
+| 1 question | 1,949 | 8.38 | 7.90 | 5.54 | 5.26 |
+| 1 question | 3,767 | 18.0 | 15.2 | 11.8 | 10.4 |
+| 1 question | 7,464 | 43.4 | 34.2 | 29.4 | 22.9 |
+| 40 questions | 10,196 | 58.0 | 48.3 | 37.6 | 32.0 |
 
-Version 0.2.0 is about 1.3 times as fast at 7,464 tokens, about 1.05 times at 1,949, and about the same at
-1,049 and below. A file copy was running on the machine for part of the measurement: the repetitions of the
-3,767-token rows and of the bfloat16 40-question row differed by up to 29%, the others by about 10% or less.
+Version 0.2.0 is about 1.3 times as fast at 7,464 tokens, 1.14 to 1.18 times at 3,767, about 1.05 times at
+1,949, and about the same at 1,049 and below. The 40-question request gains about 1.2 times in bfloat16; in
+float16 the two sessions gave 1.07 and 1.17. The machine was not idle in either session: in the first a file
+copy was running and some repetitions differed by up to 29%, in the second they differed by 13% at most. For
+the single-question requests of 1,049 tokens and more the two sessions' ratios agree within 0.03, except the
+3,767-token bfloat16 row, which was noisy in the first.
 
-Where the time goes inside the 7,464-token request in bfloat16, measured by draining the GPU queue around each
-part:
+Where the time goes inside the 7,464-token request, measured by draining the GPU queue around each part:
 
-| Part of the request | 0.1.0 | 0.2.0 |
-|---|---:|---:|
-| Sliding-window attention (the function this port supplies) | 13.6 s (28%) | 3.6 s (9%) |
-| Feed-forward layers | 23.5 s (48%) | 25.0 s (61%) |
-| Attention projections, norms and rotation | 7.3 s (15%) | 7.7 s (19%) |
-| Global attention | 3.8 s (8%) | 3.9 s (9%) |
-| Everything else | 0.9 s (2%) | 0.9 s (2%) |
+| Part of the request | bfloat16, 0.1.0 | bfloat16, 0.2.0 | float16, 0.1.0 | float16, 0.2.0 |
+|---|---:|---:|---:|---:|
+| Sliding-window attention (the function this port supplies) | 12.8 s (29%) | 3.0 s (9%) | 8.4 s (30%) | 2.1 s (9%) |
+| Feed-forward layers | 20.2 s (46%) | 20.3 s (60%) | 11.9 s (42%) | 12.0 s (54%) |
+| Attention projections, norms and rotation | 6.9 s (16%) | 6.6 s (19%) | 4.4 s (15%) | 4.4 s (20%) |
+| Global attention | 3.3 s (8%) | 3.3 s (10%) | 2.6 s (9%) | 2.7 s (12%) |
+| Everything else | 0.9 s (2%) | 0.9 s (3%) | 1.0 s (3%) | 0.9 s (4%) |
 
-The sliding-window attention itself became 3.8 times faster, but with 0.2.0 it is about a tenth of a long
-request; the rest is karpo-decision's and PyTorch's own code, which this port does not change. In float16 the
-shares were about the same (29% and 8%; the machine was in use during that run). At 1,949 tokens the
-sliding-window attention was 11% of the request with 0.1.0 and is 7% with 0.2.0. Converting to float16, above,
-does more for speed than this change. The 31B has not been timed end to end with 0.2.0, and the per-request
-table at the top of this section was measured with 0.1.0.
+The sliding-window attention itself became about four times faster, but with 0.2.0 it is under a tenth of a
+long request; the rest is karpo-decision's and PyTorch's own code, which this port does not change. At 1,949
+tokens the sliding-window attention was 11 to 12% of the request with 0.1.0 and is 7 to 8% with 0.2.0.
+Converting to float16, above, does more for speed than this change. The 31B has not been timed end to end with
+0.2.0, and the per-request table at the top of this section was measured with 0.1.0.
 
 ## What is verified, and how
 
@@ -470,8 +477,8 @@ with the quantized MLX copies described above.
 **Does it work on Intel Macs?** PyTorch 2.15.0 has no Intel macOS build, so this package cannot be installed there.
 
 **Does it work on Linux or Windows without an NVIDIA GPU (CPU, AMD, Intel Arc)?** The patch is plain PyTorch
-and is not tied to macOS. CPU has been checked with a tiny random model only; AMD and Intel GPUs have not been
-checked at all.
+and is not tied to macOS. On CPU the real 12B has been run on an Apple Silicon Mac only; Linux and Windows, and
+AMD and Intel GPUs, have not been checked at all.
 
 **Is there a GGUF, llama.cpp or Ollama version?** Not here. This port keeps MachinePulse's own inference code,
 which Karpo Decision's answers depend on, and changes its attention at run time.
