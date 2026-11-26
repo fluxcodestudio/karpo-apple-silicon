@@ -1,9 +1,10 @@
 # Copyright 2026 FluxCode Studio and the karpo-apple-silicon contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Dense statement of the attention rule, independent of the banded implementation.
+"""Dense statements of the two attention rules, independent of the chunked implementations.
 
-This slower, quadratic-memory oracle tests ``attend`` and supports the comparison script's
-wrong-on-purpose controls. ``install()`` never uses it.
+These slower, quadratic-memory oracles test ``attend`` and ``global_attend`` and support the
+wrong-on-purpose controls of the comparison script and the upstream suite check. ``install()`` never
+uses them.
 """
 
 from __future__ import annotations
@@ -61,3 +62,33 @@ def wrong_window_minus_one(lq: int, lk: int, window: int, device: torch.device |
 def wrong_window_plus_one(lq: int, lk: int, window: int, device: torch.device | str) -> torch.Tensor:
     """Add one key to the permitted window."""
     return window_mask(lq, lk, window + 1, device)
+
+
+def dense_global(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_bounds: list[int],
+                 k_bounds: list[int], lens: torch.Tensor | None, causal: bool, scale: float, *,
+                 hidden: int = 0) -> torch.Tensor:
+    """One call per sequence over all of its keys, as karpo-decision makes it without CUDA: a plain oracle
+    for ``global_attend``. ``hidden`` keys at the end of each sequence are left out (wrong on purpose)."""
+    outs = []
+    for qa, qb, ka, kb in zip(q_bounds[:-1], q_bounds[1:], k_bounds[:-1], k_bounds[1:], strict=True):
+        lq, lk = qb - qa, kb - ka - hidden
+        if lq == 0:
+            continue
+        q = query[:, qa:qb].transpose(1, 2)
+        k = key[:, ka:ka + lk].transpose(1, 2)
+        v = value[:, ka:ka + lk].transpose(1, 2)
+        mask = window_mask(lq, lk, lk, query.device) if causal else None
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale,
+                                             enable_gqa=key.shape[2] != query.shape[2])
+        outs.append(out[0].transpose(0, 1))
+    if not outs:
+        return query.new_empty((0, query.shape[2] * query.shape[3]))
+    out = torch.cat(outs)
+    return out.reshape(out.shape[0], -1)
+
+
+def wrong_global_last_key_hidden(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_bounds: list[int],
+                                 k_bounds: list[int], lens: torch.Tensor | None, causal: bool,
+                                 scale: float) -> torch.Tensor:
+    """Hide each sequence's last key from its queries."""
+    return dense_global(query, key, value, q_bounds, k_bounds, lens, causal, scale, hidden=1)

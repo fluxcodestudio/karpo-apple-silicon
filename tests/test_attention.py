@@ -283,7 +283,30 @@ class AgainstUpstreamPlan(unittest.TestCase):
         with patch.object(torch.cuda, "is_available", return_value=False):
             install()
         self.assertIs(sliding_attention.attend, attend)
-        self.assertIsNot(packed.sdpa_kernel, original_kernel)
+        self.assertIs(packed.Packed._global, karpo_apple_silicon.global_attend)
+        self.assertIs(packed.sdpa_kernel, original_kernel)   # the replaced global layers never reach it
+
+    def test_forced_install_with_cuda_leaves_the_global_layers(self):
+        from karpo_decision.families.gemma import packed, sliding_attention
+
+        original_global = packed.Packed.__dict__["_global"]
+        with patch.object(torch.cuda, "is_available", return_value=True):
+            install()
+            self.assertIsNot(sliding_attention.attend, attend)
+            install(force=True)
+        self.assertIs(sliding_attention.attend, attend)
+        self.assertIs(packed.Packed.__dict__["_global"], original_global)
+
+    def test_wrong_global_signature_is_rejected_before_anything_is_swapped(self):
+        from karpo_decision.families.gemma import packed, sliding_attention
+
+        original_attend = sliding_attention.attend
+        with patch.object(packed.Packed, "_global", staticmethod(lambda query: query)), \
+             patch.object(torch.cuda, "is_available", return_value=False), \
+             self.assertRaisesRegex(RuntimeError, "not supported"):
+            install()
+        self.assertIs(sliding_attention.attend, original_attend)
+        self.assertFalse(karpo_apple_silicon._originals)
 
     def test_commit_warning_and_matching_commit(self):
         checked = karpo_apple_silicon.TESTED_UPSTREAM_COMMITS

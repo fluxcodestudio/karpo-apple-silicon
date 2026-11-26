@@ -9,9 +9,11 @@ attention that computes the same thing on any device. Queries are answered ``CHU
 chunk reading only the keys its window can reach, so a long sequence costs its length times the
 window and not its length squared.
 
-On a machine without CUDA, ``install()`` also lifts the kernel selection around the global layers'
-attention (``karpo_decision.families.gemma.packed.sdpa_kernel``): it asks for a CUDA kernel, and on
-a CPU that leaves no kernel at all.
+On a machine without CUDA, ``install()`` also replaces the global layers' attention
+(``karpo_decision.families.gemma.packed.Packed._global``). There karpo-decision makes one call over a
+whole sequence, whose score table is heads x length x length, inside a kernel selection that leaves a
+CPU with no kernel at all. ``global_attend`` makes the same call ``CHUNK`` query rows at a time, so
+no table grows with the square of the length.
 
 The rule, for one virtual sequence with ``Lq`` queries and ``Lk`` keys and ``d = Lk - Lq``:
 
@@ -23,16 +25,14 @@ it. karpo-decision passes ``window = sliding_window - 1`` (1,023 for Gemma 4), s
 1,024 keys in all.
 
 Nothing in site-packages is edited; the two names are swapped at run time, and ``uninstall()`` puts
-them back.
+them back. On a machine with CUDA nothing is swapped unless forced, and the global layers never are.
 """
 
 from __future__ import annotations
 
-import contextlib
 import inspect
 import json
 import warnings
-from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, distribution, version
 from typing import Any
 
@@ -40,7 +40,7 @@ import torch
 import torch.nn.functional as F
 
 __version__ = "0.2.0"
-__all__ = ["CHUNK", "TESTED_UPSTREAM", "attend", "install", "uninstall", "window_mask"]
+__all__ = ["CHUNK", "TESTED_UPSTREAM", "attend", "global_attend", "install", "uninstall", "window_mask"]
 
 #: The karpo-decision release this was written against and checked with.
 TESTED_UPSTREAM = "0.1.0"
@@ -53,13 +53,15 @@ TESTED_UPSTREAM_COMMITS = ("c52d3507a254d3ad8423726c6bc6568c99113e7d", "6600011e
 #: The commit the install instructions name.
 TESTED_UPSTREAM_COMMIT = TESTED_UPSTREAM_COMMITS[0]
 
-#: Queries answered per attention call. A chunk reads at most ``CHUNK + window`` keys, where one call per
-#: sequence would read them all. On Apple GPUs, times were flat from 128 to 256 and worse at 64 and 512.
+#: Queries answered per attention call. In a sliding-window layer a chunk reads at most ``CHUNK + window``
+#: keys, where one call per sequence would read them all. On Apple GPUs, times were flat from 128 to 256 and
+#: worse at 64 and 512. In a global layer a chunk reads all of its sequence's keys.
 CHUNK = 256
 
 #: What ``install()`` replaced in this process, by name, for ``uninstall()``.
-_originals: dict[str, Callable[..., Any]] = {}
+_originals: dict[str, Any] = {}
 _ATTEND_PARAMETERS = ("query", "key", "value", "q_cu", "k_cu", "max_q", "max_k", "scale", "window")
+_GLOBAL_PARAMETERS = ("query", "key", "value", "q_bounds", "k_bounds", "lens", "causal", "scale")
 
 
 def window_mask(lq: int, lk: int, window: int, device: torch.device | str = "cpu") -> torch.Tensor:
@@ -119,6 +121,58 @@ def attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_cu: to
     return torch.cat(outs)
 
 
+def global_attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_bounds: list[int],
+                  k_bounds: list[int], lens: torch.Tensor | None, causal: bool, scale: float) -> torch.Tensor:
+    """Drop-in for ``karpo_decision.families.gemma.packed.Packed._global`` on a device without CUDA.
+
+    ``query`` is (1, T, heads, D); ``key`` and ``value`` are (1, Tk, kv heads, D), with ``heads`` a multiple
+    of ``kv heads``. Virtual sequence ``n`` has query rows ``[q_bounds[n], q_bounds[n + 1])`` and key rows
+    ``[k_bounds[n], k_bounds[n + 1])``. A query reads every key of its sequence, or, when ``causal``, the
+    keys up to its own, the last query sitting on the last key. ``lens`` is accepted for signature
+    compatibility and not needed. Returns (query rows, heads x D).
+
+    One difference from the original: a causal sequence with more queries than keys, whose first queries
+    have no key to read, is a ``ValueError`` here. karpo-decision never builds one (a sequence's keys
+    include its own rows), and the original answers such rows without an error.
+
+    karpo-decision makes one call per sequence here. Its score table is heads x queries x keys, which
+    for a long request is more than a Mac's memory holds; the 12B's answers to a 23,627-token request
+    came back as noise that way on a 96 GB Mac. This makes the same call ``CHUNK`` query rows at a time,
+    which is the same attention (``reference.dense_global``) with a table that stays small.
+    """
+    if len(q_bounds) != len(k_bounds):
+        raise ValueError(f"{len(q_bounds) - 1} query sequences but {len(k_bounds) - 1} key sequences")
+    if query.shape[2] % key.shape[2]:
+        raise ValueError(f"{query.shape[2]} query heads are not a multiple of {key.shape[2]} key/value heads")
+    enable_gqa = key.shape[2] != query.shape[2]
+    outs = []
+    for qa, qb, ka, kb in zip(q_bounds[:-1], q_bounds[1:], k_bounds[:-1], k_bounds[1:], strict=True):
+        lq, lk = qb - qa, kb - ka
+        if lq == 0:
+            continue
+        if causal and lk < lq:
+            raise ValueError(f"global attention: {lq} causal queries over {lk} keys leaves queries without any key")
+        q = query[:, qa:qb].transpose(1, 2)                                     # (1, heads, lq, D)
+        k = key[:, ka:kb].transpose(1, 2)                                       # (1, kv heads, lk, D)
+        v = value[:, ka:kb].transpose(1, 2)
+        for a in range(0, lq, CHUNK):
+            b = min(a + CHUNK, lq)
+            if causal:
+                # Rows a..b read keys up to their own, so nothing past the chunk's last readable key is
+                # needed, and on that slice the end-aligned rule is a window that never clips.
+                hi = b + lk - lq
+                out = F.scaled_dot_product_attention(q[:, :, a:b], k[:, :, :hi], v[:, :, :hi],
+                                                     attn_mask=window_mask(b - a, hi, hi, query.device),
+                                                     scale=scale, enable_gqa=enable_gqa)
+            else:
+                out = F.scaled_dot_product_attention(q[:, :, a:b], k, v, scale=scale, enable_gqa=enable_gqa)
+            outs.append(out[0].transpose(0, 1))                                 # (b - a, heads, D)
+    if not outs:
+        return query.new_empty((0, query.shape[2] * query.shape[3]))
+    out = torch.cat(outs)
+    return out.reshape(out.shape[0], -1)
+
+
 def _installed_commit() -> str | None:
     """The git commit karpo-decision was installed from, when pip recorded one (``pip install`` from a
     git URL does; a local or editable install does not)."""
@@ -129,22 +183,17 @@ def _installed_commit() -> str | None:
     return json.loads(direct_url).get("vcs_info", {}).get("commit_id") if direct_url else None
 
 
-def _unrestricted_sdpa_kernel(*args: Any, **kwargs: Any) -> contextlib.AbstractContextManager[None]:
-    """Stands in for ``sdpa_kernel`` on a machine without CUDA. Kernel selection only chooses among
-    CUDA kernels; asking for one where there is none leaves the CPU with no kernel at all."""
-    return contextlib.nullcontext()
-
-
 def install(force: bool = False) -> None:
     """Swap karpo-decision's sliding-window attention for ``attend`` in this process and, on a machine
-    without CUDA, lift the kernel selection around its global layers' attention.
+    without CUDA, its global layers' attention for ``global_attend``.
 
-    Call it once, before ``Decider.decide``. On a machine with CUDA the original kernel works and is
-    faster, so nothing is changed there unless ``force`` is true (useful for comparing the two); kernel
-    selection is never changed there. Calling it again changes nothing.
+    Call it once, before ``Decider.decide``. On a machine with CUDA the original kernels work and are
+    faster, so nothing is changed there unless ``force`` is true (useful for comparing the two); the
+    global layers are never changed there. Calling it again changes nothing.
 
-    Warns when karpo-decision is not a commit this was checked with, and raises ``RuntimeError`` when
-    its ``attend`` no longer takes the arguments this replacement was written for.
+    Warns when karpo-decision is not a commit this was checked with, and raises ``RuntimeError``, before
+    anything is swapped, when a function to be replaced no longer takes the arguments its replacement
+    was written for.
     """
     try:
         from karpo_decision.families.gemma import packed, sliding_attention
@@ -177,13 +226,20 @@ def install(force: bool = False) -> None:
     has_cuda = torch.cuda.is_available()
     if has_cuda and not force:
         return
-    if "attend" not in _originals:
-        _originals["attend"] = original_attend
-    sliding_attention.attend = attend
+    original_global = None
     if not has_cuda:
-        if "sdpa_kernel" not in _originals:
-            _originals["sdpa_kernel"] = packed.sdpa_kernel
-        packed.sdpa_kernel = _unrestricted_sdpa_kernel
+        # The class attribute itself (a staticmethod), so that uninstall() puts back the same object.
+        original_global = _originals.get("global", vars(getattr(packed, "Packed", None) or object).get("_global"))
+        if not isinstance(original_global, staticmethod):
+            raise RuntimeError("karpo_decision.families.gemma.packed.Packed has no static _global(); "
+                               "this karpo-decision version is not supported")
+        if tuple(inspect.signature(original_global.__func__).parameters) != _GLOBAL_PARAMETERS:
+            raise RuntimeError("this karpo-decision is not supported: Packed._global() has a different signature")
+    _originals.setdefault("attend", original_attend)
+    sliding_attention.attend = attend
+    if original_global is not None:
+        _originals.setdefault("global", original_global)
+        packed.Packed._global = staticmethod(global_attend)
 
 
 def uninstall() -> None:
@@ -194,6 +250,6 @@ def uninstall() -> None:
 
     if "attend" in _originals:
         sliding_attention.attend = _originals["attend"]
-    if "sdpa_kernel" in _originals:
-        packed.sdpa_kernel = _originals["sdpa_kernel"]
+    if "global" in _originals:
+        packed.Packed._global = _originals["global"]
     _originals.clear()
