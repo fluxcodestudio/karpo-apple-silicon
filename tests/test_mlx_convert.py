@@ -12,28 +12,16 @@ import io
 import json
 import shutil
 import string
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import numpy as np
+from _support import mlx_unavailable
 
-def unavailable() -> str | None:
-    """Why the MLX path cannot be tested here, or None."""
-    for name in ("mlx", "mlx_lm", "karpo_decision", "transformers.models.gemma4", "tokenizers", "safetensors"):
-        try:
-            found = importlib.util.find_spec(name)
-        except ModuleNotFoundError:
-            found = None
-        if found is None:
-            return f"needs {name}"
-    try:
-        import mlx.core  # noqa: F401
-    except Exception as error:  # MLX raises on import when there is no Metal device
-        return f"MLX cannot start: {error}"
-    return None
-
-
-SKIP = unavailable()
+SKIP = mlx_unavailable("transformers.models.gemma4", "tokenizers", "safetensors")
 SPECIALS = ["<pad>", "<unk>", "<bos>", "<mask>", "<start_of_turn>", "<end_of_turn>"]
 #: One token per character: printable ASCII, the chat template's hole and the brackets request text is escaped with.
 CHARACTERS = sorted(set(string.printable) | {"\x00", "\uff1c", "\uff1e"})
@@ -45,6 +33,63 @@ TYPES = ["sliding_attention", "full_attention", "sliding_attention", "full_atten
 REQUEST = {"state": {"light": "red", "note": "<mask> is escaped"},
            "questions": {"go": {"type": "noul", "instructions": "May the car go?"},
                          "next": {"type": "choice", "criteria": {"stop": "Stay", "drive": None, "turn": "Turn back"}}}}
+#: Another state, and a question of the third type beside the two above.
+SCORED = {"state": {"light": "amber", "note": "the road is wet"},
+          "questions": {**REQUEST["questions"],
+                        "urgency": {"type": "score", "instructions": "How urgent is it?",
+                                    "criteria": ["not at all", "somewhat", "very", "extremely"]}}}
+#: A soft cap and temperatures that move the answers. The checkpoint's own cap of 30 and temperatures of 1.0 leave
+#: them nearly or exactly where they were, so a decider that skipped either step would still pass with those.
+CAP = 4.0
+TEMPERATURES = {"choice": 0.5, "noul": 2.0, "score": 1.5}
+
+
+def by_hand(hidden: np.ndarray, readout: np.ndarray, requests: list[dict], cap: float | None,
+            temperatures: dict[str, float]) -> list[dict[str, np.ndarray]]:
+    """Per request, each question's probabilities over its options, by the rule karpo-decision's ``Readout`` and
+    ``Decider.decide`` state, in float64: the logits are the hidden states at the readout rows times the readout
+    rows, soft-capped as ``cap * tanh(logits / cap)``; a question reads the first codes of its row, one per
+    option, divides them by its type's temperature and takes their softmax. One sequence per request, its
+    readout rows in question order."""
+    logits = hidden @ readout.T
+    if cap is not None:
+        logits = cap * np.tanh(logits / cap)
+    rows = iter(logits)
+    answers = []
+    for request in requests:
+        answers.append({})
+        for key, question in request["questions"].items():
+            options = 2 if question["type"] == "noul" else len(question["criteria"])
+            scaled = next(rows)[:options] / temperatures[question["type"]]
+            weights = np.exp(scaled - scaled.max())
+            answers[-1][key] = weights / weights.sum()
+    return answers
+
+
+def numbers(response: dict) -> list[float]:
+    """Every probability a response states, in question and option order (a noul answer states one, of true)."""
+    return [value for answer in response["answers"].values()
+            for value in ([answer["noul"]] if answer["type"] == "noul" else answer["probabilities"].values())]
+
+
+@contextlib.contextmanager
+def forward_passes():
+    """Record every forward pass made while the block runs: its sequences' lengths, and the hidden states it
+    returned at their readout rows, bfloat16 values that float64 holds exactly."""
+    import mlx.core as mx
+
+    from karpo_apple_silicon import mlx as karpo_mlx
+
+    real = karpo_mlx._marker_states
+    passes: list[tuple[list[int], np.ndarray]] = []
+
+    def recorded(model, sequences, window, rope):
+        states = real(model, sequences, window, rope)
+        passes.append(([part.length for part in sequences], np.array(states.astype(mx.float32)).astype(np.float64)))
+        return states
+
+    with mock.patch.object(karpo_mlx, "_marker_states", recorded):
+        yield passes
 
 
 def converter():
@@ -128,6 +173,7 @@ class ConvertAndLoad(unittest.TestCase):
                          .format(name="tiny-mlx-8bit", bits=8, group_size=64))
         self.assertIn("quantized to 8 bits (group size 64)", (self.target / "NOTICE").read_text())
         decider = karpo_mlx.load(self.target)
+        self.assertEqual((decider.token_budget, karpo_mlx.DEFAULT_TOKEN_BUDGET), (4096, 4096))
         layers = decider.model.language_model.layers
         self.assertEqual(layers[0].self_attn.q_proj.weight.dtype, mx.uint32)  # quantized
         self.assertFalse(hasattr(layers[1].self_attn, "v_proj"))  # a global layer: keys and values share one
@@ -165,9 +211,97 @@ class ConvertAndLoad(unittest.TestCase):
             decider.decide({**REQUEST, "images": ["data:image/png;base64,AAAA"]})
         shared = decider.encoder.plan(REQUEST, None)[0].length
         split = karpo_mlx.load(self.target, max_length=shared - 20)  # room for one branch at a time
-        self.assertEqual(split.decide(REQUEST)["usage"]["sequences"], 2)
+        parts = split.encoder.plan(REQUEST, split.max_length)
+        self.assertEqual(split.decide(REQUEST)["usage"],  # each part repeats the state: more tokens than unsplit
+                         {"input_tokens": sum(part.length for part in parts), "output_tokens": 0, "sequences": 2})
+        self.assertGreater(sum(part.length for part in parts), shared)
         with self.assertRaises(LengthError):
             karpo_mlx.load(self.target, max_length=50).decide(REQUEST)
+
+    def test_answers_are_karpo_decisions_readout_rule_worked_by_hand(self):
+        """``decide`` against ``by_hand`` on the hidden states of the same forward pass, with a cap and
+        temperatures that matter, for all three question types and both readout precisions.
+
+        With a float32 readout nothing is rounded to bfloat16 after the hidden states, so only float32
+        arithmetic separates the two: 5.7e-8 when measured, 1e-5 allowed. With a bfloat16 readout the product
+        itself is computed in bfloat16, eight bits of mantissa, where the oracle multiplies the same rounded
+        rows exactly: 4.3e-4 when measured, 5e-3 allowed."""
+        import torch
+        from safetensors.numpy import load_file
+
+        from karpo_apple_silicon import mlx as karpo_mlx
+
+        requests = [REQUEST, SCORED]
+        for readout_dtype, tolerance in (("float32", 1e-5), ("bfloat16", 5e-3)):
+            folder = self.work / f"by hand {readout_dtype}"
+            shutil.copytree(self.target, folder)
+            metadata = json.loads((folder / "mlx_config.json").read_text())
+            metadata["text_config"]["final_logit_softcapping"] = CAP
+            (folder / "mlx_config.json").write_text(json.dumps(metadata))
+            decision = json.loads((folder / "decision_config.json").read_text())
+            (folder / "decision_config.json").write_text(json.dumps({**decision, "temperatures": TEMPERATURES,
+                                                                    "readout_dtype": readout_dtype}))
+            decider = karpo_mlx.load(folder)
+            with forward_passes() as passes:
+                responses = decider.decide(requests)
+            hidden = np.concatenate([states for _, states in passes])
+            readout = torch.from_numpy(load_file(str(folder / "readout.safetensors"))["weight"])
+            readout = readout.to(getattr(torch, readout_dtype)).double().numpy()  # the rows as the decider holds them
+            want = by_hand(hidden, readout, requests, CAP, TEMPERATURES)
+            for request, response, expected in zip(requests, responses, want, strict=True):
+                plan = decider.encoder.plan(request, decider.max_length)
+                self.assertEqual([part.keys for part in plan], [tuple(request["questions"])])  # as by_hand reads
+                self.assertEqual(response["usage"], {"input_tokens": plan[0].length, "output_tokens": 0,
+                                                     "sequences": 1})
+                for key, question in request["questions"].items():
+                    answer, probabilities = response["answers"][key], expected[key]
+                    with self.subTest(readout=readout_dtype, question=key):
+                        if question["type"] == "noul":
+                            self.assertAlmostEqual(answer["noul"], probabilities[1], delta=tolerance)
+                            continue
+                        levels = np.arange(len(probabilities))
+                        names = list(question["criteria"]) if question["type"] == "choice" else [str(i) for i in levels]
+                        self.assertEqual(list(answer["probabilities"]), names)
+                        np.testing.assert_allclose(list(answer["probabilities"].values()), probabilities, rtol=0,
+                                                   atol=tolerance)
+                        if question["type"] == "choice":
+                            self.assertEqual(answer["choice"], names[int(probabilities.argmax())])
+                        else:  # the expected level: each probability's error counts once per level
+                            self.assertAlmostEqual(answer["score"], float(probabilities @ levels),
+                                                   delta=levels.sum() * tolerance)
+            # Left out of the rule, either step moves a probability by far more than is allowed above.
+            ones = dict.fromkeys(TEMPERATURES, 1.0)
+            for step, without in (("the cap", by_hand(hidden, readout, requests, None, TEMPERATURES)),
+                                  ("the temperatures", by_hand(hidden, readout, requests, CAP, ones))):
+                moved = max(np.abs(a[key] - b[key]).max() for a, b in zip(want, without, strict=True) for key in a)
+                self.assertGreater(moved, 0.1, f"{step} would not show with a {readout_dtype} readout")
+
+    def test_the_token_budget_decides_which_sequences_share_a_forward_pass(self):
+        """Three requests of one length, ``L`` tokens each: together under the default budget; two and one when
+        the budget is exactly ``2 L``; alone when it is one token less, and when it is 1 (a sequence longer than
+        the budget still runs). The answers do not depend on it beyond bfloat16 rounding in the layers, which
+        differs with the rows a sequence shares its attention calls with: 2.5e-4 when measured, ten times that
+        allowed."""
+        from karpo_apple_silicon import mlx as karpo_mlx
+
+        requests = [{**REQUEST, "state": {**REQUEST["state"], "light": light}} for light in ("red", "tan", "sky")]
+        decider = karpo_mlx.load(self.target)
+        lengths = [decider.encoder.plan(request, decider.max_length)[0].length for request in requests]
+        length = lengths[0]
+        self.assertEqual(lengths, [length] * 3)
+        with forward_passes() as passes:
+            together = decider.decide(requests)
+        self.assertEqual([sizes for sizes, _ in passes], [[length] * 3])
+        self.assertNotEqual(numbers(together[0]), numbers(together[1]))  # the three are different requests
+        for budget, expected in ((2 * length, [[length, length], [length]]), (2 * length - 1, [[length]] * 3),
+                                 (1, [[length]] * 3)):
+            with self.subTest(budget=budget):
+                with forward_passes() as passes:
+                    responses = karpo_mlx.load(self.target, token_budget=budget).decide(requests)
+                self.assertEqual([sizes for sizes, _ in passes], expected)
+                for response, packed in zip(responses, together, strict=True):
+                    self.assertEqual(response["usage"], packed["usage"])
+                    np.testing.assert_allclose(numbers(response), numbers(packed), rtol=0, atol=2.5e-3)
 
     def test_an_incomplete_or_altered_folder_fails_the_load(self):
         import mlx.core as mx
@@ -192,6 +326,22 @@ class ConvertAndLoad(unittest.TestCase):
             self.assertIn(str(folder), str(raised.exception))
             # MLX's own message is the cause: a ValueError from the strict load, a RuntimeError from reading a file
             self.assertIsInstance(raised.exception.__cause__, RuntimeError if damage is cut_short else ValueError)
+
+    def test_a_tensor_in_two_files_is_reported_as_that(self):
+        """Not as an incomplete folder: every tensor is there, one of them twice."""
+        import mlx.core as mx
+
+        from karpo_apple_silicon import mlx as karpo_mlx
+
+        folder = self.work / "a tensor twice"
+        shutil.copytree(self.target, folder)
+        name, value = min(mx.load(str(folder / "text-00001.safetensors")).items())
+        mx.save_safetensors(str(folder / "text-00003.safetensors"), {name: value})
+        with self.assertRaisesRegex(ValueError, "1 tensors are in more than one file") as raised:
+            karpo_mlx.load(folder)
+        self.assertIn(str(folder), str(raised.exception))
+        self.assertIn(name, str(raised.exception))
+        self.assertNotIn("is incomplete", str(raised.exception))
 
     def test_a_folder_that_is_not_a_converted_copy_says_so(self):
         """The original checkpoint, a folder cut off before its configuration was written, a configuration
@@ -261,33 +411,101 @@ class ConvertAndLoad(unittest.TestCase):
 
     def test_a_source_the_loader_could_not_read_is_refused_before_anything_is_written(self):
         write_checkpoint(self.work / "prefixed", prefix="model.language_model.")
-        with self.assertRaisesRegex(SystemExit, "holds no tensor named language_model"):
+        with self.assertRaisesRegex(ValueError, "holds no tensor named language_model"):
             self.run_convert(self.work / "prefixed", self.work / "prefixed-mlx")
         (self.work / "source-short").mkdir()
         for path in (self.work / "source").iterdir():
             if path.name != "model-00002-of-00002.safetensors":
                 shutil.copy2(path, self.work / "source-short" / path.name)
-        with self.assertRaisesRegex(SystemExit, "missing"):
+        with self.assertRaisesRegex(ValueError, "missing"):
             self.run_convert(self.work / "source-short", self.work / "short-mlx")
         for name in ("prefixed-mlx", "prefixed-mlx.partial", "short-mlx", "short-mlx.partial"):
             self.assertFalse((self.work / name).exists(), name)
 
     def test_a_bit_width_the_loader_was_not_checked_with_is_refused(self):
-        with self.assertRaisesRegex(SystemExit, "bits must be 8 or 4, not 6"):
+        with self.assertRaisesRegex(ValueError, "bits must be 8 or 4, not 6"):
             self.convert.convert(self.work / "source", self.work / "six-bit", 6)
         for name in ("six-bit", "six-bit.partial"):
             self.assertFalse((self.work / name).exists(), name)
 
     def test_an_existing_target_and_a_leftover_partial_folder_are_refused_and_kept(self):
-        with self.assertRaisesRegex(SystemExit, "already exists"):
+        with self.assertRaisesRegex(ValueError, "already exists"):
             self.run_convert(self.work / "source", self.target)
         leftover = self.work / "again.partial"
         leftover.mkdir()
         (leftover / "text-00001.safetensors").write_bytes(b"half a file")
-        with self.assertRaisesRegex(SystemExit, "remove it and run again"):
+        with self.assertRaisesRegex(ValueError, "remove it and run again"):
             self.run_convert(self.work / "source", self.work / "again")
         self.assertEqual((leftover / "text-00001.safetensors").read_bytes(), b"half a file")
         self.assertFalse((self.work / "again").exists())
+
+    def test_missing_files_are_file_not_found_errors(self):
+        """A source without its small files, and one without weight files, name what is missing."""
+        empty = self.work / "no checkpoint"
+        empty.mkdir()
+        with self.assertRaisesRegex(FileNotFoundError, "has no config.json, tokenizer.json"):
+            self.run_convert(empty, self.work / "from-nothing")
+        with self.assertRaisesRegex(FileNotFoundError, "has neither model-.* shards nor model.safetensors"):
+            self.convert.weight_files(empty)
+        for name in ("from-nothing", "from-nothing.partial"):
+            self.assertFalse((self.work / name).exists(), name)
+
+    def test_a_checkpoint_that_cannot_be_converted_is_a_value_error(self):
+        """Another model type, global layers of two head sizes, a causal checkpoint and a tensor in two files are
+        refused before anything is written. A tensor of another shape is found once the copy is written, and the
+        copy stays in ``.partial`` for the next run to refuse."""
+        import torch
+        from safetensors.torch import load_file, save_file
+
+        def altered(name: str, file: str | None = None, change=None) -> Path:
+            folder = self.work / name
+            shutil.copytree(self.work / "source", folder)
+            if file:
+                (folder / file).write_text(json.dumps(change(json.loads((folder / file).read_text()))))
+            return folder
+
+        def two_head_sizes(config: dict) -> dict:
+            config["text_config"]["per_layer_config"]["1"]["head_dim"] = 8
+            return config
+
+        first, third = "model-00001-of-00002.safetensors", "model-00003-of-00002.safetensors"
+        embedding = "language_model.embed_tokens.weight"
+        twice = altered("a source tensor twice")
+        save_file({embedding: load_file(str(twice / first))[embedding]}, str(twice / third))
+        for folder, pattern in (
+                (altered("another model type", "config.json", lambda config: {**config, "model_type": "gemma3"}),
+                 r"only the 31B \(model_type gemma4\) has been converted and checked, not 'gemma3'"),
+                (altered("two head sizes", "config.json", two_head_sizes), "do not share one head size"),
+                (altered("a causal source", "decision_config.json", lambda config: {**config, "attention": "causal"}),
+                 "cannot be converted: only bidirectional checkpoints"),
+                (twice, rf"holds 1 tensors in more than one file \(the first: {embedding}\)")):
+            target = self.work / (folder.name + " mlx")
+            with self.subTest(folder.name), self.assertRaisesRegex(ValueError, pattern):
+                self.run_convert(folder, target)
+            self.assertFalse(target.exists() or target.with_name(target.name + ".partial").exists(), folder.name)
+
+        reshaped = altered("a tensor of another shape")
+        tensors = load_file(str(reshaped / first))
+        tensors["language_model.layers.0.layer_scalar"] = torch.zeros(3, dtype=torch.bfloat16)
+        save_file(tensors, str(reshaped / first))
+        with self.assertRaisesRegex(ValueError, "is not what the loader expects: 1 of another shape"):
+            self.run_convert(reshaped, self.work / "reshaped-mlx")
+        self.assertTrue((self.work / "reshaped-mlx.partial").is_dir())
+        self.assertFalse((self.work / "reshaped-mlx").exists())
+
+    def test_the_command_line_exits_with_the_reason(self):
+        """``main()`` ends with what ``convert`` raised as its message, which Python prints to stderr with exit
+        status 1: a ``ValueError`` (the target exists) and a ``FileNotFoundError`` (no source files)."""
+        nowhere = self.work / "not a folder"
+        for source, target, message in (
+                (self.work / "source", self.target, f"{self.target} already exists; nothing was written"),
+                (nowhere, self.work / "from-nowhere",
+                 f"{nowhere} has no {', '.join(('config.json', *self.convert.COPIED))}")):
+            with self.subTest(message=message):
+                with mock.patch.object(sys, "argv", ["convert_mlx.py", str(source), str(target)]), \
+                     self.assertRaises(SystemExit) as raised:
+                    self.convert.main()
+                self.assertEqual(raised.exception.code, message)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 # Copyright 2026 FluxCode Studio and the karpo-apple-silicon contributors
 # SPDX-License-Identifier: Apache-2.0
 """Tiny Gemma 4 configuration and block layouts follow upstream's Apache-2.0
-tests/test_gemma_blocks.py, without importing its test helpers.
+tests/test_gemma_blocks.py, without importing its test helpers. ``KARPO_TEST_NO_MPS=1`` leaves out the Apple GPU
+test.
 """
 
 from __future__ import annotations
@@ -9,15 +10,16 @@ from __future__ import annotations
 import contextlib
 import types
 import unittest
+from functools import partial
 from unittest.mock import patch
 
 import torch
+from _support import needs_apple_gpu, sequence
 
 import karpo_apple_silicon
-from karpo_apple_silicon.reference import dense_attend
+from karpo_apple_silicon.reference import dense_attend, wrong_window_minus_one
 
 try:
-    from karpo_decision.encoding import Encoded
     from karpo_decision.families.gemma import packed, sliding_attention
     from karpo_decision.model.packed import pack
     from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
@@ -34,27 +36,12 @@ LAYOUTS = (
     ((3, (12, 15)),),
     ((13, ()),),
 )
-
-
-def sequence(shared: int, branches: tuple[int, ...]) -> Encoded:
-    """Build one shared block with optional branches and their final-token markers."""
-    lengths = [shared, *branches]
-    input_ids = torch.randint(3, 97, (sum(lengths),))
-    positions = list(range(shared))
-    segments = [0] * shared
-    markers = []
-    at = shared
-    for number, length in enumerate(branches, start=1):
-        positions.extend(range(shared, shared + length))
-        segments.extend([number] * length)
-        at += length
-        markers.append(at - 1)
-    if not branches:
-        markers.append(shared - 1)
-    return Encoded(keys=tuple(str(index) for index in range(max(1, len(branches)))),
-                   counts=(2,) * max(1, len(branches)), input_ids=input_ids,
-                   markers=torch.tensor(markers), positions=torch.tensor(positions),
-                   segment_ids=torch.tensor(segments, dtype=torch.int16))
+#: How far the Apple GPU may be from the CPU's float32 on ``LAYOUTS[1]``, as a share of the largest value.
+#: Measured on a MacBook Pro M2 Max (Mac14,6, torch 2.15.0; five runs gave the same numbers): float16 0.0104
+#: bidirectional and 0.0072 causal, bfloat16 0.0631 and 0.0601, float32 2.0e-6 and 1.3e-6. The half precisions
+#: get about five and three times that, since other Apple GPUs were not measured; a window one key too short
+#: moves the result by more than 1, far outside either.
+MPS_TOLERANCE = {torch.float32: 1e-4, torch.float16: 0.05, torch.bfloat16: 0.2}
 
 
 def model(dtype: torch.dtype) -> Gemma4TextModel:
@@ -155,10 +142,18 @@ class PackedForward(unittest.TestCase):
         self.assertIs(sliding_attention.attend, original_attend)
         self.assertIs(packed.Packed.__dict__["_global"], original_global)
 
-    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
+    @needs_apple_gpu
     def test_mps_matches_cpu(self):
+        """The Apple GPU within ``MPS_TOLERANCE`` of the CPU, and a window one key too short, run on the GPU
+        in the same precision, outside it. In the same measurement that window moved the result by 1.20 to 1.42
+        of its largest value in every precision, some ten times the loosest tolerance, so none of the three is
+        too coarse here to tell the two windows apart."""
+        def relative(result: torch.Tensor, reference: torch.Tensor) -> float:
+            return float((result.cpu().float() - reference).abs().max() / reference.abs().max())
+
+        one_key_short = partial(dense_attend, mask=wrong_window_minus_one)
         for attention in ("bidirectional", "causal"):
-            for dtype, tolerance in ((torch.float32, 1e-4), (torch.float16, 0.2), (torch.bfloat16, 0.2)):
+            for dtype, tolerance in MPS_TOLERANCE.items():
                 with self.subTest(attention=attention, dtype=dtype):
                     language_model = model(torch.float32)
                     torch.manual_seed(1)
@@ -167,5 +162,8 @@ class PackedForward(unittest.TestCase):
                     torch.manual_seed(1)
                     gpu = self.forward(language_model, LAYOUTS[1], attention, "mps")
                     self.assertTrue(torch.isfinite(gpu).all())
-                    relative = (gpu.cpu().float() - cpu).abs().max() / cpu.abs().max()
-                    self.assertLess(float(relative), tolerance)
+                    self.assertLess(relative(gpu, cpu), tolerance)
+                    torch.manual_seed(1)
+                    with patch.object(sliding_attention, "attend", one_key_short):
+                        wrong = self.forward(language_model, LAYOUTS[1], attention, "mps")
+                    self.assertGreater(relative(wrong, cpu), tolerance)

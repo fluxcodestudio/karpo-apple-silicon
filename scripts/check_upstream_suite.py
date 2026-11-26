@@ -20,7 +20,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-PINNED_COMMIT = "c52d3507a254d3ad8423726c6bc6568c99113e7d"
+REPO = Path(__file__).resolve().parents[1]
+# This checkout's package, as in the test runs below, not a copy installed from somewhere else.
+sys.path.insert(0, str(REPO))
+
+from karpo_apple_silicon import TESTED_UPSTREAM_COMMIT  # noqa: E402
+
 VARIANTS = ("port", "top-left", "window-1", "window+1", "no-window", "global-1")
 MISMATCH = re.compile(r"^E\s+AssertionError: Tensor-likes are not close!", re.MULTILINE)
 TESTS = ("tests/test_gemma_blocks.py", "tests/test_gemma_padded.py", "tests/test_gemma_images.py")
@@ -30,14 +35,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("checkout", help="path to the pinned karpo-decision source checkout")
     checkout = Path(parser.parse_args().checkout).resolve()
-    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout, capture_output=True, text=True,
-                            check=True).stdout.strip()
-    if commit != PINNED_COMMIT:
-        print(f"warning: upstream checkout is {commit}, expected {PINNED_COMMIT}", file=sys.stderr)
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout, capture_output=True, text=True,
+                                check=True).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):  # no repository or commit there, or no such folder
+        print(f"error: {checkout} is not a git checkout (git rev-parse HEAD failed there)", file=sys.stderr)
+        return 2
+    if commit != TESTED_UPSTREAM_COMMIT:
+        print(f"warning: upstream checkout is {commit}, expected {TESTED_UPSTREAM_COMMIT}", file=sys.stderr)
 
-    repo = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(repo / "tests"), str(repo), env.get("PYTHONPATH"))))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(REPO / "tests"), str(REPO), env.get("PYTHONPATH"))))
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     success = True
     for variant in VARIANTS:

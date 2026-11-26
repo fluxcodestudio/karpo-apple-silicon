@@ -11,31 +11,14 @@ its global layers' CUDA kernel selection is lifted, both for the length of one c
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import types
 import unittest
 from unittest import mock
 
 import numpy as np
+from _support import mlx_unavailable, sequence
 
-
-def unavailable() -> str | None:
-    """Why the MLX path cannot be tested here, or None."""
-    for name in ("mlx", "mlx_lm", "karpo_decision", "transformers.models.gemma4"):
-        try:
-            found = importlib.util.find_spec(name)
-        except ModuleNotFoundError:
-            found = None
-        if found is None:
-            return f"needs {name}"
-    try:
-        import mlx.core  # noqa: F401
-    except Exception as error:  # MLX raises on import when there is no Metal device
-        return f"MLX cannot start: {error}"
-    return None
-
-
-SKIP = unavailable()
+SKIP = mlx_unavailable("transformers.models.gemma4")
 WINDOW = 8
 TYPES = ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention", "sliding_attention",
          "full_attention"]
@@ -71,23 +54,6 @@ def tiny(heads: int, kv: int, global_kv: int, head: int, global_head: int):
             layer.layer_scalar.fill_(0.8 + 0.05 * index)
     text = {**config.to_dict(), "global_head_dim": global_head, "num_global_key_value_heads": global_kv}
     return model, text
-
-
-def sequence(shared: int, branches: list[int]):
-    """A block layout: one block of ``shared`` tokens, or a shared block and one branch per entry."""
-    import torch
-    from karpo_decision.encoding import Encoded
-
-    positions, segments, markers, at = list(range(shared)), [0] * shared, [], shared
-    for number, rows in enumerate(branches, start=1):
-        positions += range(shared, shared + rows)
-        segments += [number] * rows
-        at += rows
-        markers.append(at - 1)
-    count = max(1, len(branches))
-    return Encoded(keys=tuple(str(i) for i in range(count)), counts=(2,) * count, input_ids=torch.randint(3, 97, (at,)),
-                   markers=torch.tensor(markers or [shared - 1]), positions=torch.tensor(positions),
-                   segment_ids=torch.tensor(segments, dtype=torch.int16))
 
 
 def upstream_states(model, sequences) -> np.ndarray:
@@ -147,7 +113,7 @@ class Forward(unittest.TestCase):
         """The pack above is 54 rows: in chunks of five, eleven attention calls per layer, not one."""
         from karpo_apple_silicon import mlx as karpo_mlx
 
-        _, plan = karpo_mlx._plan_dict([sequence(13, [5, 7, 3]), sequence(11, []), sequence(3, [12])], WINDOW)
+        _, plan = karpo_mlx._pack_and_plan([sequence(13, [5, 7, 3]), sequence(11, []), sequence(3, [12])], WINDOW)
         masks = karpo_mlx.attention_masks(plan, WINDOW)
         self.assertEqual({name: len(karpo_mlx._chunks(mask, 5)) for name, mask in masks.items()},
                          {"global": 11, "sliding": 11, "last": 1})

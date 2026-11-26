@@ -5,25 +5,12 @@ weights. Skipped where MLX cannot start (no Metal device: sandboxes, some CI run
 
 from __future__ import annotations
 
-import importlib.util
 import unittest
 
 import numpy as np
+from _support import mlx_unavailable
 
-
-def unavailable() -> str | None:
-    """Why the MLX path cannot be tested here, or None."""
-    for name in ("mlx", "mlx_lm", "karpo_decision"):
-        if importlib.util.find_spec(name) is None:
-            return f"needs {name}"
-    try:
-        import mlx.core  # noqa: F401
-    except Exception as error:  # MLX raises on import when there is no Metal device
-        return f"MLX cannot start: {error}"
-    return None
-
-
-SKIP = unavailable()
+SKIP = mlx_unavailable()
 
 
 def per_row_masks(plan: dict, window: int) -> dict[str, np.ndarray]:
@@ -51,11 +38,12 @@ def per_row_masks(plan: dict, window: int) -> dict[str, np.ndarray]:
 
 
 def upstream_plan(layout: list[tuple[int, list[int]]], window: int) -> dict:
-    """karpo-decision's own plan for sequences of (shared rows, [rows of each branch]), as ``_plan_dict`` reads it."""
+    """karpo-decision's own plan for sequences of (shared rows, [rows of each branch]), as ``_pack_and_plan``
+    reads it."""
     import torch
     from karpo_decision.encoding import Encoded
 
-    from karpo_apple_silicon.mlx import _plan_dict
+    from karpo_apple_silicon.mlx import _pack_and_plan
 
     sequences = []
     for shared, branches in layout:
@@ -69,7 +57,7 @@ def upstream_plan(layout: list[tuple[int, list[int]]], window: int) -> dict:
                                  counts=(2,) * max(1, len(branches)), input_ids=torch.zeros(at, dtype=torch.long),
                                  markers=torch.tensor(markers or [shared - 1]), positions=torch.tensor(positions),
                                  segment_ids=torch.tensor(segments, dtype=torch.int16)))
-    return _plan_dict(sequences, window)[1]
+    return _pack_and_plan(sequences, window)[1]
 
 
 @unittest.skipIf(SKIP, SKIP)
@@ -175,8 +163,10 @@ class Masks(unittest.TestCase):
                     rebuilt[start:stop, low:high] = True if part is None else np.array(part)
                 with self.subTest(mask=name, size=size):
                     self.assertTrue(np.array_equal(rebuilt, mask))
-        with self.assertRaisesRegex(ValueError, "reads no key"):
+        with self.assertRaisesRegex(ValueError, "attention row 1 reads no key"):
             _chunks(np.array([[True, False], [False, False]]), 2)
+        with self.assertRaisesRegex(ValueError, r"attention row 0 reads no key \(the first of 3 such rows\)"):
+            _chunks(np.zeros((3, 2), dtype=bool), 2)
 
 
 @unittest.skipIf(SKIP, SKIP)

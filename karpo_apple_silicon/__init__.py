@@ -40,7 +40,8 @@ import torch
 import torch.nn.functional as F
 
 __version__ = "0.2.0"
-__all__ = ["CHUNK", "TESTED_UPSTREAM", "attend", "global_attend", "install", "uninstall", "window_mask"]
+__all__ = ["CHUNK", "TESTED_UPSTREAM", "TESTED_UPSTREAM_COMMIT", "TESTED_UPSTREAM_COMMITS", "attend", "global_attend",
+           "install", "uninstall", "window_mask"]
 
 #: The karpo-decision release this was written against and checked with.
 TESTED_UPSTREAM = "0.1.0"
@@ -55,22 +56,36 @@ TESTED_UPSTREAM_COMMIT = TESTED_UPSTREAM_COMMITS[0]
 
 #: Queries answered per attention call. In a sliding-window layer a chunk reads at most ``CHUNK + window``
 #: keys, where one call per sequence would read them all. On Apple GPUs, times were flat from 128 to 256 and
-#: worse at 64 and 512. In a global layer a chunk reads all of its sequence's keys.
+#: worse at 64 and 512. In a global layer a chunk reads all of its sequence's keys, or, when causal, the keys up
+#: to its last row's own.
 CHUNK = 256
 
 #: What ``install()`` replaced in this process, by name, for ``uninstall()``.
 _originals: dict[str, Any] = {}
-_ATTEND_PARAMETERS = ("query", "key", "value", "q_cu", "k_cu", "max_q", "max_k", "scale", "window")
-_GLOBAL_PARAMETERS = ("query", "key", "value", "q_bounds", "k_bounds", "lens", "causal", "scale")
 
 
 def window_mask(lq: int, lk: int, window: int, device: torch.device | str = "cpu") -> torch.Tensor:
     """(lq, lk) boolean mask, True where query i may read key j: ``i + d - window <= j <= i + d``
-    with ``d = lk - lq``."""
+    with ``d = lk - lq``.
+
+    ``window`` is flash attention's ``window_size``, which is the model's ``sliding_window`` minus one, so a
+    query reads up to ``window + 1`` keys; ``mlx.attention_masks`` takes ``sliding_window`` itself as its
+    ``window``, so a query there reads up to ``window`` keys.
+    """
     i = torch.arange(lq, device=device)[:, None]
     j = torch.arange(lk, device=device)[None, :]
     diagonal = i + (lk - lq)
     return (j <= diagonal) & (j >= diagonal - window)
+
+
+def _check_sequences_and_heads(q_bounds: list[int], k_bounds: list[int], heads: int, kv_heads: int) -> None:
+    """``ValueError`` unless the query and key boundaries mark the same number of sequences and the query heads
+    are a multiple of the key/value heads. The two functions here and their oracles in ``reference`` all call
+    it, so they refuse the same input in the same words."""
+    if len(q_bounds) != len(k_bounds):
+        raise ValueError(f"{len(q_bounds) - 1} query sequences but {len(k_bounds) - 1} key sequences")
+    if heads % kv_heads:
+        raise ValueError(f"{heads} query heads are not a multiple of {kv_heads} key/value heads")
 
 
 def attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_cu: torch.Tensor, k_cu: torch.Tensor,
@@ -88,10 +103,7 @@ def attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_cu: to
     keys every query would discard left out.
     """
     q_bounds, k_bounds = q_cu.tolist(), k_cu.tolist()
-    if len(q_bounds) != len(k_bounds):
-        raise ValueError(f"{len(q_bounds) - 1} query sequences but {len(k_bounds) - 1} key sequences")
-    if query.shape[1] % key.shape[1]:
-        raise ValueError(f"{query.shape[1]} query heads are not a multiple of {key.shape[1]} key/value heads")
+    _check_sequences_and_heads(q_bounds, k_bounds, query.shape[1], key.shape[1])
     enable_gqa = key.shape[1] != query.shape[1]
     outs = []
     for qa, qb, ka, kb in zip(q_bounds[:-1], q_bounds[1:], k_bounds[:-1], k_bounds[1:], strict=True):
@@ -140,10 +152,7 @@ def global_attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q
     came back as noise that way on a 96 GB Mac. This makes the same call ``CHUNK`` query rows at a time,
     which is the same attention (``reference.dense_global``) with a table that stays small.
     """
-    if len(q_bounds) != len(k_bounds):
-        raise ValueError(f"{len(q_bounds) - 1} query sequences but {len(k_bounds) - 1} key sequences")
-    if query.shape[2] % key.shape[2]:
-        raise ValueError(f"{query.shape[2]} query heads are not a multiple of {key.shape[2]} key/value heads")
+    _check_sequences_and_heads(q_bounds, k_bounds, query.shape[2], key.shape[2])
     enable_gqa = key.shape[2] != query.shape[2]
     outs = []
     for qa, qb, ka, kb in zip(q_bounds[:-1], q_bounds[1:], k_bounds[:-1], k_bounds[1:], strict=True):
@@ -171,6 +180,11 @@ def global_attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q
         return query.new_empty((0, query.shape[2] * query.shape[3]))
     out = torch.cat(outs)
     return out.reshape(out.shape[0], -1)
+
+
+#: The parameter names ``install()`` requires of the two functions it replaces: the replacements' own, in order.
+_ATTEND_PARAMETERS = tuple(inspect.signature(attend).parameters)
+_GLOBAL_PARAMETERS = tuple(inspect.signature(global_attend).parameters)
 
 
 def _installed_commit() -> str | None:
@@ -229,7 +243,9 @@ def install(force: bool = False) -> None:
     original_global = None
     if not has_cuda:
         # The class attribute itself (a staticmethod), so that uninstall() puts back the same object.
-        original_global = _originals.get("global", vars(getattr(packed, "Packed", None) or object).get("_global"))
+        packed_class = getattr(packed, "Packed", None)
+        class_attribute = None if packed_class is None else vars(packed_class).get("_global")
+        original_global = _originals.get("global", class_attribute)
         if not isinstance(original_global, staticmethod):
             raise RuntimeError("karpo_decision.families.gemma.packed.Packed has no static _global(); "
                                "this karpo-decision version is not supported")

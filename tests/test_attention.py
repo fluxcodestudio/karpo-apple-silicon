@@ -1,12 +1,14 @@
 # Copyright 2026 FluxCode Studio and the karpo-apple-silicon contributors
 # SPDX-License-Identifier: Apache-2.0
 """Tests that need torch only (no weights, no GPU). The last class also needs karpo-decision.
+``KARPO_TEST_NO_MPS=1`` leaves out the Apple GPU class.
 
     python -m unittest discover -s tests -v
 """
 
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import unittest
 import warnings
@@ -14,10 +16,17 @@ from itertools import pairwise
 from unittest.mock import patch
 
 import torch
+from _support import attention_calls, needs_apple_gpu
 
 import karpo_apple_silicon
 from karpo_apple_silicon import attend, install, window_mask
-from karpo_apple_silicon.reference import dense_attend, wrong_window_minus_one
+from karpo_apple_silicon.reference import (
+    dense_attend,
+    wrong_no_window,
+    wrong_top_left,
+    wrong_window_minus_one,
+    wrong_window_plus_one,
+)
 
 
 def allowed(i: int, j: int, lq: int, lk: int, window: int) -> bool:
@@ -111,9 +120,36 @@ class Attend(unittest.TestCase):
                 self.check(2, 1, 8, [0, 4, 9], [0, 6, 11], 1023, 1.0, seed=4)
                 self.check(2, 2, 4, [0, 3], [0, 5], 0, 1.0, seed=5)
 
+    def test_every_call_answers_a_chunk_over_the_keys_its_window_reaches(self):
+        """What the port is for: however long a sequence is, no call gets more than ``CHUNK`` queries or more
+        than ``CHUNK + window`` keys, so no score table grows with the square of the length. The results cannot
+        show this: they are the same whatever ``CHUNK`` is."""
+        chunk, window = 5, 3
+        q_lengths, k_lengths = [31, 12, 2], [31, 40, 2]  # the first two are several chunks and windows long
+        generator = torch.Generator().manual_seed(9)
+        q = torch.randn(sum(q_lengths), 4, 8, generator=generator)
+        k = torch.randn(sum(k_lengths), 2, 8, generator=generator)
+        q_cu, k_cu = (torch.tensor([0, *lengths]).cumsum(0) for lengths in (q_lengths, k_lengths))
+        with patch.object(karpo_apple_silicon, "CHUNK", chunk), attention_calls() as calls:
+            attend(q, k, k, q_cu, k_cu, max(q_lengths), max(k_lengths), 1.0, window)
+        self.assertEqual(sum(rows for rows, _ in calls), sum(q_lengths))  # every query answered, and once
+        self.assertLessEqual(max(rows for rows, _ in calls), chunk)
+        self.assertLessEqual(max(keys for _, keys in calls), chunk + window)
+
     def test_empty_sequence_is_skipped(self):
         self.check(heads=2, kv_heads=2, dim=4, q_bounds=[0, 3, 3, 6], k_bounds=[0, 3, 5, 8],
                    window=2, scale=1.0, seed=6)
+
+    def test_nothing_to_answer_is_an_empty_tensor_like_the_queries(self):
+        """No query rows at all, in sequences without queries or in no sequence: karpo-decision goes on to
+        reshape what comes back, so it must be a tensor of the queries' shape and type."""
+        for dtype in (torch.float32, torch.bfloat16):
+            q, k = torch.zeros(0, 4, 8, dtype=dtype), torch.ones(5, 2, 8, dtype=dtype)
+            for q_bounds, k_bounds in (([0, 0, 0], [0, 3, 5]), ([0], [0])):
+                with self.subTest(dtype=dtype, q_bounds=q_bounds):
+                    got = attend(q, k, k, torch.tensor(q_bounds), torch.tensor(k_bounds), 0, 3, 1.0, 2)
+                    self.assertIsInstance(got, torch.Tensor)
+                    self.assertEqual((got.shape, got.dtype), (torch.Size([0, 4, 8]), dtype))
 
     def test_sequences_do_not_leak_into_each_other(self):
         generator = torch.Generator().manual_seed(7)
@@ -142,12 +178,14 @@ class Attend(unittest.TestCase):
             attend(q, k, k, torch.tensor([0, 5]), torch.tensor([0, 3]), 5, 3, 1.0, 2)
 
     def test_mismatched_boundaries_and_heads_are_errors(self):
-        q, k = torch.randn(4, 3, 4), torch.randn(4, 2, 4)
-        with self.assertRaisesRegex(ValueError, "not a multiple"):
-            attend(q, k, k, torch.tensor([0, 4]), torch.tensor([0, 4]), 4, 4, 1.0, 2)
-        q = torch.randn(4, 2, 4)
-        with self.assertRaisesRegex(ValueError, "key sequences"):
-            attend(q, k, k, torch.tensor([0, 2, 4]), torch.tensor([0, 4]), 4, 4, 1.0, 2)
+        for function in (attend, dense_attend):  # the oracle refuses them in the same words
+            with self.subTest(function=function.__name__):
+                q, k = torch.randn(4, 3, 4), torch.randn(4, 2, 4)
+                with self.assertRaisesRegex(ValueError, "3 query heads are not a multiple of 2 key/value heads"):
+                    function(q, k, k, torch.tensor([0, 4]), torch.tensor([0, 4]), 4, 4, 1.0, 2)
+                q = torch.randn(4, 2, 4)
+                with self.assertRaisesRegex(ValueError, "2 query sequences but 1 key sequences"):
+                    function(q, k, k, torch.tensor([0, 2, 4]), torch.tensor([0, 4]), 4, 4, 1.0, 2)
 
 
 class DenseReference(unittest.TestCase):
@@ -172,12 +210,18 @@ class DenseReference(unittest.TestCase):
                 self.assertTrue(torch.allclose(got.double(), want, atol=1e-5))
 
     def test_wrong_mask_is_detected(self):
+        """Each wrong-on-purpose mask gives another result than the port. The sequence has more keys than
+        queries: with as many of each, the diagonal aligned at the start is the right one."""
         generator = torch.Generator().manual_seed(12)
-        q, k, v = (torch.randn(8, 2, 4, generator=generator) for _ in range(3))
-        cu = torch.tensor([0, 8])
-        correct = attend(q, k, v, cu, cu, 8, 8, 0.5, 2)
-        wrong = dense_attend(q, k, v, cu, cu, 8, 8, 0.5, 2, mask=wrong_window_minus_one)
-        self.assertGreater(float((correct - wrong).abs().max()), 0.01)
+        q = torch.randn(6, 2, 4, generator=generator)
+        k, v = (torch.randn(10, 2, 4, generator=generator) for _ in range(2))
+        q_cu, k_cu = torch.tensor([0, 6]), torch.tensor([0, 10])
+        correct = attend(q, k, v, q_cu, k_cu, 6, 10, 0.5, 2)
+        torch.testing.assert_close(dense_attend(q, k, v, q_cu, k_cu, 6, 10, 0.5, 2), correct)
+        for mask in (wrong_no_window, wrong_top_left, wrong_window_minus_one, wrong_window_plus_one):
+            with self.subTest(mask=mask.__name__):
+                wrong = dense_attend(q, k, v, q_cu, k_cu, 6, 10, 0.5, 2, mask=mask)
+                self.assertGreater(float((correct - wrong).abs().max()), 0.01)
 
     def test_real_chunk_and_large_windows(self):
         for q_lengths, k_lengths, window, heads, kv_heads in (
@@ -195,7 +239,7 @@ class DenseReference(unittest.TestCase):
                 self.assertLess(float((attend(*args) - dense_attend(*args)).abs().max()), 1e-12)
 
 
-@unittest.skipUnless(torch.backends.mps.is_available(), "MPS is not available")
+@needs_apple_gpu
 class AgainstMPS(unittest.TestCase):
     def test_device_and_precision(self):
         generator = torch.Generator().manual_seed(13)
@@ -212,6 +256,41 @@ class AgainstMPS(unittest.TestCase):
                 self.assertLess(float((got.cpu().float() - cpu).abs().max()), tolerance)
 
 
+class InstallWithoutUpstream(unittest.TestCase):
+    """``install()`` where importing karpo-decision fails. The import is made to fail here, so this runs with
+    and without karpo-decision installed."""
+
+    def install_with_import_failing(self, error: ModuleNotFoundError) -> ModuleNotFoundError:
+        """What ``install()`` raises when importing anything of karpo-decision raises ``error``."""
+        real_import = builtins.__import__
+
+        def failing(name, *arguments, **options):
+            if name.split(".")[0] == "karpo_decision":
+                raise error
+            return real_import(name, *arguments, **options)
+
+        self.addCleanup(karpo_apple_silicon.uninstall)
+        with patch.object(builtins, "__import__", failing), self.assertRaises(ModuleNotFoundError) as raised:
+            install()
+        self.assertFalse(karpo_apple_silicon._originals)
+        return raised.exception
+
+    def test_a_missing_karpo_decision_is_answered_with_its_install_line(self):
+        for name in ("karpo_decision", "karpo_decision.families.gemma"):
+            with self.subTest(missing=name):
+                error = ModuleNotFoundError(f"No module named {name!r}", name=name)
+                raised = self.install_with_import_failing(error)
+                self.assertIn("karpo-decision is installed separately: pip install \"karpo-decision @ git+https://"
+                              "github.com/machinepulse-ai/karpo-decision@"
+                              f"{karpo_apple_silicon.TESTED_UPSTREAM_COMMIT}\"", str(raised))
+                self.assertIs(raised.__cause__, error)
+
+    def test_another_missing_module_is_raised_as_it_is(self):
+        """karpo-decision is there and something it imports is not: the install line would be the wrong advice."""
+        error = ModuleNotFoundError("No module named 'transformers'", name="transformers")
+        self.assertIs(self.install_with_import_failing(error), error)
+
+
 @unittest.skipUnless(importlib.util.find_spec("karpo_decision"), "karpo-decision is not installed")
 class AgainstUpstreamPlan(unittest.TestCase):
     """The patch fed by karpo-decision's own ``block_plan``, checked against the rule as upstream words it, by
@@ -219,6 +298,27 @@ class AgainstUpstreamPlan(unittest.TestCase):
     at positions from its own back to ``sliding_window - 1`` before it."""
 
     WINDOW = 5  # the model's ``sliding_window``; karpo-decision passes ``WINDOW - 1`` to attend
+
+    @classmethod
+    def setUpClass(cls):
+        from karpo_decision.families.gemma import packed, sliding_attention
+
+        # In a tuple: a staticmethod kept as an attribute of this class would come back as its bare function.
+        cls.found = (sliding_attention.attend, packed.Packed.__dict__["_global"])
+
+    @classmethod
+    def tearDownClass(cls):
+        """Every test here that installs also uninstalls: karpo-decision is left as it was found."""
+        from karpo_decision.families.gemma import packed, sliding_attention
+
+        attend_before, global_before = cls.found
+        if sliding_attention.attend is not attend_before:
+            raise AssertionError("these tests left karpo-decision's sliding_attention.attend replaced")
+        if packed.Packed.__dict__["_global"] is not global_before:
+            raise AssertionError("these tests left karpo-decision's Packed._global replaced")
+
+    def setUp(self):
+        self.addCleanup(karpo_apple_silicon.uninstall)
 
     def pack(self, layouts):
         """``layouts``: per sequence, [shared length, branch length, ...] (no branches: one block)."""
@@ -273,9 +373,6 @@ class AgainstUpstreamPlan(unittest.TestCase):
                     want = sum(w * v[c, kh].double() for w, c in zip(torch.softmax(logits, 0), readable, strict=True))
                     self.assertTrue(torch.allclose(got[row, h].double(), want, atol=1e-5), (layouts, row, h))
 
-    def setUp(self):
-        self.addCleanup(karpo_apple_silicon.uninstall)
-
     def test_install_swaps_both_without_cuda(self):
         from karpo_decision.families.gemma import packed, sliding_attention
 
@@ -319,14 +416,16 @@ class AgainstUpstreamPlan(unittest.TestCase):
                     install(force=True)
                 self.assertEqual(bool(caught), expected)
                 if expected:
+                    self.assertEqual(caught[0].filename, __file__)  # the line that called install(), not its own
                     self.assertIn(commit[:12], str(caught[0].message))
                     self.assertIn(karpo_apple_silicon.TESTED_UPSTREAM_COMMIT[:12], str(caught[0].message))
 
     def test_version_warning_without_commit(self):
         with patch.object(karpo_apple_silicon, "_installed_commit", return_value=None), \
              patch.object(karpo_apple_silicon, "version", return_value="other"), \
-             self.assertWarnsRegex(UserWarning, "other is installed"):
+             self.assertWarnsRegex(UserWarning, "other is installed") as warned:
             install(force=True)
+        self.assertEqual(warned.filename, __file__)  # the line that called install(), not its own
 
     def test_matching_commit_overrides_different_version(self):
         with patch.object(karpo_apple_silicon, "_installed_commit",

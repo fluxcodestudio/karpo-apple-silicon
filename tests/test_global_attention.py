@@ -3,6 +3,7 @@
 """The global layers' attention answered a chunk of query rows at a time.
 
 The first class needs torch only. The second compares with karpo-decision's own whole-table call.
+``KARPO_TEST_NO_MPS=1`` leaves out the Apple GPU test.
 
     python -m unittest discover -s tests -v
 """
@@ -11,9 +12,11 @@ from __future__ import annotations
 
 import contextlib
 import unittest
+from itertools import pairwise
 from unittest.mock import patch
 
 import torch
+from _support import attention_calls, needs_apple_gpu
 
 import karpo_apple_silicon
 from karpo_apple_silicon import global_attend
@@ -86,6 +89,41 @@ class GlobalAttend(unittest.TestCase):
         self.check(q, k, v, [0, 2, 5], [0, 4, 11], causal=False)
         self.check(q, k, v, [0, 2, 5], [0, 4, 11], causal=True)
 
+    def test_more_queries_than_keys_is_answered_when_not_causal(self):
+        """Every query reads every key of its sequence, however few there are: only a causal sequence can leave
+        a query without a key."""
+        q, k, v = tensors(12, 9, heads=4, kv_heads=2)
+        q_bounds, k_bounds = [0, 9, 12], [0, 4, 9]  # nine queries over four keys, then three over five
+        self.check(q, k, v, q_bounds, k_bounds, causal=False)
+        torch.testing.assert_close(global_attend(q, k, v, q_bounds, k_bounds, None, False, 0.4),
+                                   dense_global(q, k, v, q_bounds, k_bounds, None, False, 0.4), atol=1e-12, rtol=1e-12)
+
+    def test_every_call_answers_a_chunk_of_query_rows(self):
+        """What the replacement is for: no call gets more than ``CHUNK`` query rows, so no score table is heads
+        x queries x keys of a whole sequence. Not causal, a call reads its sequence's keys, all of them; causal,
+        none past the one its last row sits on. The results cannot show this: they are the same whatever
+        ``CHUNK`` is."""
+        chunk = 4
+        q, k, v = tensors(30, 41)
+        q_bounds, k_bounds = [0, 19, 30], [0, 23, 41]  # both several chunks long, with more keys than queries
+        for causal in (False, True):
+            with patch.object(karpo_apple_silicon, "CHUNK", chunk), attention_calls() as calls:
+                global_attend(q, k, v, q_bounds, k_bounds, None, causal, 0.4)
+            remaining = iter(calls)
+            for (qa, qb), (ka, kb) in zip(pairwise(q_bounds), pairwise(k_bounds), strict=True):
+                lq, lk, answered = qb - qa, kb - ka, 0
+                while answered < lq:
+                    rows, keys = next(remaining)
+                    answered += rows
+                    with self.subTest(causal=causal, sequence=(qa, qb), rows_answered=answered):
+                        self.assertLessEqual(rows, chunk)
+                        if causal:
+                            self.assertLessEqual(keys, answered + lk - lq)
+                        else:
+                            self.assertEqual(keys, lk)
+                self.assertEqual(answered, lq, "a call took rows of two sequences")
+            self.assertEqual(list(remaining), [])
+
     def test_several_sequences_and_an_empty_one(self):
         q, k, v = tensors(12, 15, heads=4, kv_heads=2)
         for causal in (False, True):
@@ -136,14 +174,16 @@ class GlobalAttend(unittest.TestCase):
 
     def test_errors(self):
         q, k, v = tensors(6, 6)
-        with self.assertRaisesRegex(ValueError, "sequences"):
-            global_attend(q, k, v, [0, 6], [0, 3, 6], None, False, 0.4)
-        with self.assertRaisesRegex(ValueError, "multiple"):
-            global_attend(q, k[:, :, :3], v[:, :, :3], [0, 6], [0, 6], None, False, 0.4)
+        for function in (global_attend, dense_global):  # the oracle refuses them in the same words
+            with self.subTest(function=function.__name__):
+                with self.assertRaisesRegex(ValueError, "1 query sequences but 2 key sequences"):
+                    function(q, k, v, [0, 6], [0, 3, 6], None, False, 0.4)
+                with self.assertRaisesRegex(ValueError, "4 query heads are not a multiple of 3 key/value heads"):
+                    function(q, k[:, :, :3], v[:, :, :3], [0, 6], [0, 6], None, False, 0.4)
         with self.assertRaisesRegex(ValueError, "without any key"):
             global_attend(q, k, v, [0, 6], [0, 4], None, True, 0.4)
 
-    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
+    @needs_apple_gpu
     def test_apple_gpu_matches_cpu(self):
         q, k, v = tensors(300, 310, heads=4, kv_heads=2, size=8, dtype=torch.float32)
         for causal in (False, True):

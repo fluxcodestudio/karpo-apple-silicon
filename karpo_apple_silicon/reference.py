@@ -12,17 +12,14 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from karpo_apple_silicon import window_mask
+from karpo_apple_silicon import _check_sequences_and_heads, window_mask
 
 
 def dense_attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_cu: torch.Tensor, k_cu: torch.Tensor,
                  max_q: int, max_k: int, scale: float, window: int, *, mask=window_mask) -> torch.Tensor:
     """Apply one full end-aligned window mask per packed sequence as a plain oracle for ``attend``."""
     q_bounds, k_bounds = q_cu.tolist(), k_cu.tolist()
-    if len(q_bounds) != len(k_bounds):
-        raise ValueError(f"{len(q_bounds) - 1} query sequences but {len(k_bounds) - 1} key sequences")
-    if query.shape[1] % key.shape[1]:
-        raise ValueError(f"{query.shape[1]} query heads are not a multiple of {key.shape[1]} key/value heads")
+    _check_sequences_and_heads(q_bounds, k_bounds, query.shape[1], key.shape[1])
     outs = []
     for qa, qb, ka, kb in zip(q_bounds[:-1], q_bounds[1:], k_bounds[:-1], k_bounds[1:], strict=True):
         lq, lk = qb - qa, kb - ka
@@ -69,6 +66,7 @@ def dense_global(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_
                  hidden: int = 0) -> torch.Tensor:
     """One call per sequence over all of its keys, as karpo-decision makes it without CUDA: a plain oracle
     for ``global_attend``. ``hidden`` keys at the end of each sequence are left out (wrong on purpose)."""
+    _check_sequences_and_heads(q_bounds, k_bounds, query.shape[2], key.shape[2])
     outs = []
     for qa, qb, ka, kb in zip(q_bounds[:-1], q_bounds[1:], k_bounds[:-1], k_bounds[1:], strict=True):
         lq, lk = qb - qa, kb - ka - hidden

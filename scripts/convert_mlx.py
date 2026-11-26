@@ -74,26 +74,26 @@ def to_mlx(tensor: torch.Tensor) -> mx.array:
 
 def text_config(source: Path) -> dict[str, Any]:
     """The checkpoint's ``text_config`` with the global layers' head size and key/value head count under the
-    names mlx-lm reads them by."""
+    names mlx-lm reads them by. ``ValueError`` for a checkpoint that is not the 31B's kind."""
     config = json.loads((source / "config.json").read_text())
     if config.get("model_type") != "gemma4":
-        raise SystemExit(f"only the 31B (model_type gemma4) has been converted and checked, not "
+        raise ValueError(f"only the 31B (model_type gemma4) has been converted and checked, not "
                          f"{config.get('model_type')!r}")
     text = config["text_config"]
     per_layer = {(values["head_dim"], values["num_key_value_heads"]) for values in text["per_layer_config"].values()}
     if len(per_layer) != 1:
-        raise SystemExit("the global layers do not share one head size and key/value head count")
+        raise ValueError("the global layers do not share one head size and key/value head count")
     text["global_head_dim"], text["num_global_key_value_heads"] = per_layer.pop()
     return text
 
 
 def weight_files(source: Path) -> list[Path]:
     """The checkpoint's weight files: its ``model-*.safetensors`` shards in order, or its one
-    ``model.safetensors``."""
+    ``model.safetensors``. ``FileNotFoundError`` when it has neither."""
     shards = sorted(source.glob("model-*.safetensors"))
     single = source / "model.safetensors"
     if not shards and not single.is_file():
-        raise SystemExit(f"{source} has neither model-*.safetensors shards nor model.safetensors")
+        raise FileNotFoundError(f"{source} has neither model-*.safetensors shards nor model.safetensors")
     return shards or [single]
 
 
@@ -127,25 +127,26 @@ def difference(written: dict[str, tuple[int, ...] | None], expected: dict[str, t
 
 
 def convert(source: Path, target: Path, bits: int) -> None:
-    """Write the ``bits``-bit MLX copy of the checkpoint in ``source`` to ``target``. ``SystemExit`` with the
-    reason when the source cannot be converted or the result is not what ``karpo_apple_silicon.mlx.load``
-    requires; ``target`` is created only by a run that succeeds."""
+    """Write the ``bits``-bit MLX copy of the checkpoint in ``source`` to ``target``. When the source cannot be
+    converted or the result is not what ``karpo_apple_silicon.mlx.load`` requires, raises with the reason:
+    ``FileNotFoundError`` for a file the source lacks, ``ValueError`` for anything else. ``target`` is created
+    only by a run that succeeds."""
     partial = target.with_name(target.name + ".partial")
-    if bits not in BITS:
-        raise SystemExit(f"bits must be {BITS[0]} or {BITS[1]}, not {bits}")
+    if bits not in BITS:  # the command line's own check does not cover a direct call
+        raise ValueError(f"bits must be {BITS[0]} or {BITS[1]}, not {bits}")
     if target.exists():
-        raise SystemExit(f"{target} already exists; nothing was written")
+        raise ValueError(f"{target} already exists; nothing was written")
     if partial.exists():
-        raise SystemExit(f"{partial} is left from a run that did not finish: remove it and run again")
+        raise ValueError(f"{partial} is left from a run that did not finish: remove it and run again")
     absent = [name for name in ("config.json", *COPIED) if not (source / name).is_file()]
     if absent:
-        raise SystemExit(f"{source} has no {', '.join(absent)}")
+        raise FileNotFoundError(f"{source} has no {', '.join(absent)}")
     text = text_config(source)
     try:
         karpo_mlx.decision_config(source)
         expected = karpo_mlx.expected_tensors(text, bits, GROUP_SIZE)
     except ValueError as error:
-        raise SystemExit(f"{source} cannot be converted: {error}") from error
+        raise ValueError(f"{source} cannot be converted: {error}") from error
     files = weight_files(source)
     # The names alone, before anything is converted: a wrong source fails in seconds, not after the last shard.
     planned: list[str] = []
@@ -153,13 +154,13 @@ def convert(source: Path, target: Path, bits: int) -> None:
         with safe_open(str(file), framework="pt", device="cpu") as handle:
             planned += written_names(list(handle.keys()))
     if not planned:
-        raise SystemExit(f"{source} holds no tensor named {TEXT_PREFIX}*: nothing to convert")
+        raise ValueError(f"{source} holds no tensor named {TEXT_PREFIX}*: nothing to convert")
     repeated = sorted(name for name, count in Counter(planned).items() if count > 1)
     if repeated:
-        raise SystemExit(f"{source} holds {len(repeated)} tensors in more than one file (the first: {repeated[0]})")
+        raise ValueError(f"{source} holds {len(repeated)} tensors in more than one file (the first: {repeated[0]})")
     problem = difference(dict.fromkeys(planned), expected)
     if problem:
-        raise SystemExit(f"{source} does not hold the text layers the loader expects: {problem}")
+        raise ValueError(f"{source} does not hold the text layers the loader expects: {problem}")
 
     partial.mkdir(parents=True)
     written: dict[str, tuple[int, ...]] = {}
@@ -184,7 +185,7 @@ def convert(source: Path, target: Path, bits: int) -> None:
             print(f"file {number}/{len(files)}: {len(weights)} tensors", flush=True)
     problem = difference(written, expected)
     if problem:
-        raise SystemExit(f"the copy in {partial} is not what the loader expects: {problem}. Remove it before "
+        raise ValueError(f"the copy in {partial} is not what the loader expects: {problem}. Remove it before "
                          "running again.")
 
     for name in COPIED:
@@ -213,7 +214,10 @@ def main() -> None:
     parser.add_argument("target", type=Path, help="the folder to create")
     parser.add_argument("--bits", type=int, choices=BITS, default=8)
     arguments = parser.parse_args()
-    convert(arguments.source, arguments.target, arguments.bits)
+    try:
+        convert(arguments.source, arguments.target, arguments.bits)
+    except (ValueError, FileNotFoundError) as error:  # the reason alone on stderr, exit status 1
+        raise SystemExit(str(error)) from error
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ import json
 import math
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -63,6 +63,8 @@ CHUNK = 256
 SCORES_AT_ONCE = 64 * 1024 * 1024
 #: ``decision_config.json``'s ``readout_dtype`` values.
 READOUT_DTYPES = {"float32": mx.float32, "bfloat16": mx.bfloat16}
+#: Tokens per forward pass when several sequences are answered together, unless ``load`` is told otherwise.
+DEFAULT_TOKEN_BUDGET = 4096
 
 #: (first query row, one past the last, first key row, one past the last, mask over them or None for no mask).
 Chunk = tuple[int, int, int, int, mx.array | None]
@@ -223,8 +225,8 @@ def _backbone(text: dict[str, Any], bits: int, group_size: int) -> _Backbone:
 
 def _load_weights(model: _Backbone, path: Path) -> None:
     """Every ``text-*.safetensors`` of ``path`` into ``model``, all or nothing: a missing file or tensor, an
-    extra tensor, a wrong shape or a file that cannot be read (cut short, say) is an error, never a model left
-    partly at its random initial values."""
+    extra tensor, a wrong shape, a file that cannot be read (cut short, say) or a tensor in two files is an
+    error, never a model left partly at its random initial values."""
     files = sorted(path.glob("text-*.safetensors"))
     weights: dict[str, mx.array] = {}
     repeated: set[str] = set()
@@ -233,19 +235,36 @@ def _load_weights(model: _Backbone, path: Path) -> None:
             shard = mx.load(str(file))  # RuntimeError for a file that is cut short or is not safetensors
             repeated |= weights.keys() & shard.keys()
             weights.update(shard)
-        if repeated:
-            raise ValueError(f"{len(repeated)} tensors are in more than one file: {', '.join(sorted(repeated))}")
-        model.load_weights(list(weights.items()), strict=True)
+        if not repeated:
+            model.load_weights(list(weights.items()), strict=True)
     except (ValueError, RuntimeError) as error:
         reason = " ".join(str(error).split())
         reason = reason if len(reason) <= 200 else reason[:200] + " ..."
         raise ValueError(f"{path} is incomplete or was not written by scripts/convert_mlx.py: it holds "
                          f"{len(weights)} tensors in {len(files)} text-*.safetensors files. {reason}") from error
+    if repeated:  # outside the handler above: such a folder is not incomplete, and nothing was loaded from it
+        raise ValueError(f"{path}: {len(repeated)} tensors are in more than one file (the first: {min(repeated)})")
 
 
-def _plan_dict(sequences: Sequence[Encoded], window: int) -> tuple[Pack, dict[str, Any]]:
-    """``sequences`` packed end to end by karpo-decision on CPU, and its block plan as ``attention_masks``
-    reads it."""
+def _load_readout(path: Path, config: DecisionConfig, hidden_size: int) -> mx.array:
+    """The readout matrix of ``path``, (codes, hidden), in the precision ``config`` names. ``ValueError`` for a
+    precision this module does not know, a folder without ``readout.safetensors`` and a file that holds no
+    ``weight`` of that shape, so that none of them reaches the forward pass."""
+    if config.readout_dtype not in READOUT_DTYPES:
+        raise ValueError(f"readout_dtype {config.readout_dtype!r} is not one of: {', '.join(READOUT_DTYPES)}")
+    if not (path / "readout.safetensors").is_file():
+        raise ValueError(f"{path} has no readout.safetensors")
+    readout = mx.load(str(path / "readout.safetensors")).get("weight")
+    if readout is None or readout.shape != (len(config.codes), hidden_size):
+        found = "no weight" if readout is None else f"a weight of {readout.shape}"
+        raise ValueError(f"readout.safetensors holds {found}, not one of ({len(config.codes)} codes, "
+                         f"{hidden_size} hidden)")
+    return readout.astype(READOUT_DTYPES[config.readout_dtype])
+
+
+def _pack_and_plan(sequences: Sequence[Encoded], window: int) -> tuple[Pack, dict[str, Any]]:
+    """karpo-decision's pack of ``sequences``, end to end on CPU (token ids, positions and readout rows), and its
+    block plan for that pack as the dictionary ``attention_masks`` reads."""
     packed = pack(sequences, None, torch.device("cpu"))
     planned = block_plan(packed, window)
     own = np.arange(packed.tokens)  # without branches every virtual sequence's keys are its own rows
@@ -262,9 +281,11 @@ def _plan_dict(sequences: Sequence[Encoded], window: int) -> tuple[Pack, dict[st
 def _chunks(mask: np.ndarray, size: int) -> list[Chunk]:
     """``mask`` (query rows, key rows) cut into runs of ``size`` query rows, each with the shortest run of key
     rows that holds every key any of its rows may read and the mask over that run (None when every row of the
-    chunk reads the whole run)."""
-    if not mask.any(axis=1).all():
-        raise ValueError("an attention row reads no key")
+    chunk reads the whole run). ``ValueError``, naming the first such row, when a row of ``mask`` reads no key."""
+    empty = np.flatnonzero(~mask.any(axis=1))
+    if len(empty):
+        others = f" (the first of {len(empty)} such rows)" if len(empty) > 1 else ""
+        raise ValueError(f"attention row {empty[0]} reads no key{others}")
     chunks = []
     for start in range(0, mask.shape[0], size):
         stop = min(start + size, mask.shape[0])
@@ -354,7 +375,7 @@ def _marker_states(model: Gemma4TextModel, sequences: Sequence[Encoded], window:
                    rope: dict[str, tuple[float, float]]) -> mx.array:
     """The final-normed hidden states at the readout rows of ``sequences`` packed end to end, (readout rows,
     hidden), in pack order. Sequences never read each other; every layer but the last runs on every row."""
-    packed, plan = _plan_dict(sequences, window)
+    packed, plan = _pack_and_plan(sequences, window)
     chunks = {name: _chunks(mask, CHUNK) for name, mask in attention_masks(plan, window).items()}
     positions = mx.array(packed.seqpos.numpy())
     tokens = model.embed_tokens(mx.array(packed.input_ids.numpy()))
@@ -384,7 +405,8 @@ class MLXDecider:
     ``ValueError`` for a configuration this module does not compute and for a folder that is incomplete.
     """
 
-    def __init__(self, path: str | Path, token_budget: int = 4096, max_length: int = DEFAULT_MAX_LENGTH) -> None:
+    def __init__(self, path: str | Path, token_budget: int = DEFAULT_TOKEN_BUDGET,
+                 max_length: int = DEFAULT_MAX_LENGTH) -> None:
         self.path = Path(path)
         self.token_budget = token_budget
         self.max_length = max_length
@@ -402,21 +424,18 @@ class MLXDecider:
                 raise ValueError(f"code {code!r} is not token {token_id} of this tokenizer")
         self.encoder = Encoder(gemma.Processor(tokenizer, None), self.config.codes, template(self.config.template),
                                self.config.marker)
-        if self.config.readout_dtype not in READOUT_DTYPES:
-            raise ValueError(f"readout_dtype {self.config.readout_dtype!r} is not one of: {', '.join(READOUT_DTYPES)}")
-        if not (self.path / "readout.safetensors").is_file():
-            raise ValueError(f"{self.path} has no readout.safetensors")
-        readout = mx.load(str(self.path / "readout.safetensors")).get("weight")
-        if readout is None or readout.shape != (len(self.config.codes), arguments.hidden_size):
-            found = "no weight" if readout is None else f"a weight of {readout.shape}"
-            raise ValueError(f"readout.safetensors holds {found}, not one of ({len(self.config.codes)} codes, "
-                             f"{arguments.hidden_size} hidden)")
-        self.readout = readout.astype(READOUT_DTYPES[self.config.readout_dtype])
+        self.readout = _load_readout(self.path, self.config, arguments.hidden_size)
         # Everything above is cheap; the weights are read only for a folder that passed.
         self.model = _backbone(text, self.bits, metadata["group_size"])
         _load_weights(self.model, self.path)
         self.model.eval()
         mx.eval(self.model.parameters())
+
+    @overload
+    def decide(self, requests: Request) -> dict[str, Any]: ...
+
+    @overload
+    def decide(self, requests: Sequence[Request]) -> list[dict[str, Any]]: ...
 
     def decide(self, requests: Request | Sequence[Request]) -> dict[str, Any] | list[dict[str, Any]]:
         """One response per request (``{"answers": {...}, "usage": {...}}``), in input order: a single response
@@ -486,7 +505,8 @@ class MLXDecider:
         return result
 
 
-def load(path: str | Path, token_budget: int = 4096, max_length: int = DEFAULT_MAX_LENGTH) -> MLXDecider:
+def load(path: str | Path, token_budget: int = DEFAULT_TOKEN_BUDGET,
+         max_length: int = DEFAULT_MAX_LENGTH) -> MLXDecider:
     """A decider over a folder written by ``scripts/convert_mlx.py``. ``token_budget``: tokens per forward
     pass when several requests are answered together. ``max_length``: the longest single sequence; a longer
     request is split into parts of its questions (``MLXDecider``)."""

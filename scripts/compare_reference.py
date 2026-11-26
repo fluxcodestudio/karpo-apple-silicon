@@ -42,8 +42,10 @@ import json
 import statistics
 import time
 from collections import defaultdict
+from collections.abc import Callable, Iterator
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -53,8 +55,11 @@ from karpo_apple_silicon.reference import dense_attend, wrong_no_window, wrong_t
 VARIANTS = ("port", "no-window", "top-left", "window-1", "float16")
 CELLS = ("single-short", "single-long", "multi-short", "multi-long")
 
+#: One request of the sample: its cell, its track, its run id, the request and the published response.
+Sample = tuple[str, str, str, dict[str, Any], dict[str, Any]]
 
-def read_jsonl(path):
+
+def read_jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
     opener = gzip.open if str(path).endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8") as handle:
         for line in handle:
@@ -62,12 +67,13 @@ def read_jsonl(path):
                 yield json.loads(line)
 
 
-def cell_of(response) -> str:
+def cell_of(response: dict[str, Any]) -> str:
     questions = "multi" if len(response["answers"]) > 1 else "single"
     return f"{questions}-{'long' if response['usage']['input_tokens'] > 1024 else 'short'}"
 
 
-def select(rows_path, reference_path, per_cell, max_tokens, seed):
+def select(rows_path: str | Path, reference_path: str | Path, per_cell: dict[str, int], max_tokens: int,
+           seed: str) -> list[Sample]:
     """A deterministic sample: per cell, tracks in turn, requests in hash order."""
     reference = {}
     for record in read_jsonl(reference_path):
@@ -106,17 +112,17 @@ def select(rows_path, reference_path, per_cell, max_tokens, seed):
     return sample
 
 
-def probabilities(answer) -> dict[str, float]:
+def probabilities(answer: dict[str, Any]) -> dict[str, float]:
     if answer["type"] == "noul":
         return {"true": answer["noul"], "false": 1.0 - answer["noul"]}
     return answer["probabilities"]
 
 
-def top(answer) -> str:
+def top(answer: dict[str, Any]) -> str:
     return ("true" if answer["noul"] >= 0.5 else "false") if answer["type"] == "noul" else answer["choice"]
 
 
-def set_variant(name: str, decider) -> None:
+def set_variant(name: str, decider: Any) -> None:
     from karpo_decision.families.gemma import sliding_attention
 
     if name in ("port", "float16"):
@@ -135,7 +141,27 @@ def nothing() -> None:
     """Stands in for a device call where there is nothing to wait for or to free."""
 
 
-def run(decider, sample, synchronize, release, progress_path, variant):
+def summarize(stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """The aggregates written to --out, per key of ``stats`` in sorted order: counts, the largest, mean and
+    99th-percentile probability difference over the questions compared, and medians of tokens and seconds."""
+    summary = {}
+    for key, entry in sorted(stats.items()):
+        diffs = sorted(entry["diffs"])
+        summary[key] = {
+            "requests": entry["requests"], "questions": entry["questions"],
+            "token_mismatches": entry["token_mismatches"], "top_answers_changed": entry["top_changed"],
+            "max_abs_probability_difference": max(diffs) if diffs else None,
+            "mean_abs_probability_difference": statistics.fmean(diffs) if diffs else None,
+            "p99_abs_probability_difference": diffs[min(len(diffs) - 1, int(0.99 * len(diffs)))] if diffs else None,
+            "questions_differing_by_more_than_0.05": sum(d > 0.05 for d in diffs),
+            "median_input_tokens": statistics.median(entry["tokens"]), "max_input_tokens": max(entry["tokens"]),
+            "median_seconds_per_request": statistics.median(entry["seconds"]),
+        }
+    return summary
+
+
+def run(decider: Any, sample: list[Sample], synchronize: Callable[[], None], release: Callable[[], None],
+        progress_path: Path, variant: str) -> dict[str, dict[str, Any]]:
     """Answer ``sample`` and summarize. Each finished request is appended to ``progress_path`` (ids, token
     counts and differences only, never request text), and requests already there are not run again, so a
     stopped run resumes. ``release`` is called after each request, outside its timing, to free cached memory."""
@@ -181,20 +207,7 @@ def run(decider, sample, synchronize, release, progress_path, variant):
                 entry["top_changed"] += record["top_changed"]
             if (index + 1) % 20 == 0:
                 print(f"  {index + 1}/{len(sample)}", flush=True)
-    summary = {}
-    for key, entry in sorted(stats.items()):
-        diffs = sorted(entry["diffs"])
-        summary[key] = {
-            "requests": entry["requests"], "questions": entry["questions"],
-            "token_mismatches": entry["token_mismatches"], "top_answers_changed": entry["top_changed"],
-            "max_abs_probability_difference": max(diffs) if diffs else None,
-            "mean_abs_probability_difference": statistics.fmean(diffs) if diffs else None,
-            "p99_abs_probability_difference": diffs[min(len(diffs) - 1, int(0.99 * len(diffs)))] if diffs else None,
-            "questions_differing_by_more_than_0.05": sum(d > 0.05 for d in diffs),
-            "median_input_tokens": statistics.median(entry["tokens"]), "max_input_tokens": max(entry["tokens"]),
-            "median_seconds_per_request": statistics.median(entry["seconds"]),
-        }
-    return summary
+    return summarize(stats)
 
 
 def main() -> None:
@@ -215,13 +228,27 @@ def main() -> None:
                         help="cells the wrong-on-purpose variants run on")
     parser.add_argument("--control-limit", type=int, default=15,
                         help="requests per cell for every variant other than port")
-    parser.add_argument("--max-tokens", type=int, default=9000, help="skip longer requests (dense attention memory)")
+    parser.add_argument("--max-tokens", type=int, default=9000,
+                        help="skip longer requests (the wrong-on-purpose variants run dense attention, whose memory "
+                             "grows with the square of a request's length)")
     parser.add_argument("--seed", default="0")
     args = parser.parse_args()
     variants = args.variants.split(",")
     if any(v not in VARIANTS for v in variants):
         parser.error(f"variants must be from {VARIANTS}")
-    per_cell = dict(zip(CELLS, (int(n) for n in args.per_cell.split(",")), strict=True))
+    if "float16" in variants[:-1]:
+        parser.error("float16 must be the last variant: the conversion is not undone")
+    try:
+        counts = [int(n) for n in args.per_cell.split(",")]
+    except ValueError:
+        counts = []
+    if len(counts) != len(CELLS) or min(counts) < 0:
+        parser.error(f"--per-cell takes {len(CELLS)} non-negative integers, one per cell ({', '.join(CELLS)}), "
+                     f"not {args.per_cell!r}")
+    per_cell = dict(zip(CELLS, counts, strict=True))
+    controls = set(args.control_cells.split(","))
+    if not controls <= set(CELLS):
+        parser.error(f"--control-cells must be from {CELLS}")
 
     sample = select(args.rows, args.reference, per_cell, args.max_tokens, args.seed)
     print(f"sample: {len(sample)} requests", flush=True)
@@ -256,7 +283,6 @@ def main() -> None:
               "versions": {name: version(name) for name in names},
               "port_version": karpo_apple_silicon.__version__, "sample_requests": len(sample), "variants": {}}
     progress_path = Path(str(args.out) + ".progress.jsonl")
-    controls = set(args.control_cells.split(","))
     for variant in variants:
         if variant == "port":
             subset = sample
