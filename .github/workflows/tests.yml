@@ -41,11 +41,13 @@ jobs:
         if: runner.os == 'macOS'
       - run: python -m ruff check .
       # A skipped test passes silently, so only the skips this runner cannot avoid are allowed: the hosted
-      # runners report no Apple GPU, and MLX does not exist for Linux.
+      # runners report no Apple GPU, and MLX does not exist for Linux. Without pipefail the step would report
+      # tee's exit status and a failing test would pass.
       - name: Unit tests, failing on an unexpected skip
         env:
           EXPECTED_SKIPS: ${{ runner.os == 'macOS' && 'MPS' || 'MPS|MLX|mlx' }}
         run: |
+          set -o pipefail
           python -m unittest discover -s tests -v 2>&1 | tee unittest.log
           if grep -E "\.\.\. skipped" unittest.log | grep -v -E "$EXPECTED_SKIPS"; then
             echo "::error::a test was skipped for a reason this runner should not have"
