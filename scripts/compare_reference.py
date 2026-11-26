@@ -17,6 +17,9 @@ are run one at a time, as the published run did. Only aggregates are written to 
 (--out plus .progress.jsonl: ids and differences, no request text) lets a stopped run resume. Delete it to
 start again, and always after changing the code or the checkpoint.
 
+On the Apple GPU, PyTorch's cache of freed buffers is emptied after every request. Left alone it grows with
+each new request length: a 31B run of this sample on a 96 GB Mac reached 103 GB and 40 GB of swap.
+
     python scripts/compare_reference.py --checkpoint CKPT --reference results.jsonl.gz \
         --rows selected-rows.jsonl.gz --out comparison.json
 
@@ -128,10 +131,14 @@ def set_variant(name: str, decider) -> None:
         decider.ckpt.backbone.to(torch.float16)
 
 
-def run(decider, sample, synchronize, progress_path, variant):
+def nothing() -> None:
+    """Stands in for a device call where there is nothing to wait for or to free."""
+
+
+def run(decider, sample, synchronize, release, progress_path, variant):
     """Answer ``sample`` and summarize. Each finished request is appended to ``progress_path`` (ids, token
     counts and differences only, never request text), and requests already there are not run again, so a
-    stopped run resumes."""
+    stopped run resumes. ``release`` is called after each request, outside its timing, to free cached memory."""
     done = {}
     if progress_path.exists():
         for record in read_jsonl(progress_path):
@@ -160,6 +167,7 @@ def run(decider, sample, synchronize, progress_path, variant):
                         record["top_changed"] += top(answer) != top(theirs)
                 progress.write(json.dumps(record) + "\n")
                 progress.flush()
+                release()
             for key in (cell, f"track:{track}", "all"):
                 entry = stats[key]
                 entry["requests"] += 1
@@ -229,13 +237,15 @@ def main() -> None:
         from karpo_apple_silicon import mlx as karpo_mlx
 
         decider = karpo_mlx.load(args.checkpoint)
-        synchronize = mx.synchronize
+        synchronize, release = mx.synchronize, nothing
         names = ("karpo-decision", "torch", "transformers", "mlx", "mlx-lm")
     else:
         from karpo_decision.decider import Decider
 
         karpo_apple_silicon.install()
-        synchronize = torch.mps.synchronize if torch.device(args.device).type == "mps" else (lambda: None)
+        on_apple_gpu = torch.device(args.device).type == "mps"
+        synchronize = torch.mps.synchronize if on_apple_gpu else nothing
+        release = torch.mps.empty_cache if on_apple_gpu else nothing
         decider = Decider.from_pretrained(args.checkpoint, device=args.device)
         names = ("karpo-decision", "torch", "transformers")
     print(f"loaded in {time.perf_counter() - started:.0f} s", flush=True)
@@ -256,7 +266,7 @@ def main() -> None:
         print(f"variant {variant}: {len(subset)} requests", flush=True)
         if args.backend == "torch":
             set_variant(variant, decider)
-        report["variants"][variant] = run(decider, subset, synchronize, progress_path, variant)
+        report["variants"][variant] = run(decider, subset, synchronize, release, progress_path, variant)
         overall = report["variants"][variant]["all"]
         print(json.dumps({k: overall[k] for k in ("requests", "questions", "token_mismatches", "top_answers_changed",
                                                   "max_abs_probability_difference",
