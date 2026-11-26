@@ -193,6 +193,30 @@ class ConvertAndLoad(unittest.TestCase):
             # MLX's own message is the cause: a ValueError from the strict load, a RuntimeError from reading a file
             self.assertIsInstance(raised.exception.__cause__, RuntimeError if damage is cut_short else ValueError)
 
+    def test_a_folder_that_is_not_a_converted_copy_says_so(self):
+        """The original checkpoint, a folder cut off before its configuration was written, a configuration
+        with an entry missing and an unknown readout precision are each a ``ValueError`` naming the problem."""
+        from karpo_apple_silicon import mlx as karpo_mlx
+
+        with self.assertRaisesRegex(ValueError, "has no mlx_config.json") as raised:
+            karpo_mlx.load(self.work / "source")                    # the checkpoint the copy was made from
+        self.assertIn("scripts/convert_mlx.py", str(raised.exception))
+        folder = self.work / "small files"
+        shutil.copytree(self.target, folder, ignore=shutil.ignore_patterns("text-*"))
+        metadata = json.loads((folder / "mlx_config.json").read_text())
+        (folder / "mlx_config.json").write_text(json.dumps({k: v for k, v in metadata.items() if k != "group_size"}))
+        with self.assertRaisesRegex(ValueError, "mlx_config.json has no group_size"):
+            karpo_mlx.load(folder)
+        (folder / "mlx_config.json").write_text(json.dumps(metadata))
+        decision = json.loads((folder / "decision_config.json").read_text())
+        (folder / "decision_config.json").write_text(json.dumps({**decision, "readout_dtype": "float8"}))
+        with self.assertRaisesRegex(ValueError, "readout_dtype 'float8'"):
+            karpo_mlx.load(folder)
+        (folder / "decision_config.json").write_text(json.dumps(decision))
+        (folder / "readout.safetensors").unlink()
+        with self.assertRaisesRegex(ValueError, "has no readout.safetensors"):
+            karpo_mlx.load(folder)
+
     def test_the_configuration_is_checked_before_any_weight_is_read(self):
         """A folder the loader cannot answer with is refused for what is wrong with it, although the folder
         holds no weights either: a causal checkpoint, codes that are not the tokenizer's, more layer types than

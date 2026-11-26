@@ -121,6 +121,20 @@ def _columns(rows: np.ndarray) -> slice | np.ndarray:
     return rows
 
 
+def _metadata(path: Path) -> dict[str, Any]:
+    """``mlx_config.json`` of a folder written by ``scripts/convert_mlx.py``. ``ValueError`` when the folder has
+    none or it lacks an entry, so that a folder which is not a converted copy says so."""
+    file = path / "mlx_config.json"
+    if not file.is_file():
+        raise ValueError(f"{path} has no mlx_config.json, so it was not written by scripts/convert_mlx.py (the "
+                         "original checkpoint is loaded with karpo-decision's Decider, not with this module)")
+    metadata = json.loads(file.read_text())
+    missing = [key for key in ("bits", "group_size", "text_config") if key not in metadata]
+    if missing:
+        raise ValueError(f"{file} has no {', '.join(missing)}")
+    return metadata
+
+
 def decision_config(path: str | Path) -> DecisionConfig:
     """``decision_config.json`` of ``path``, read and validated by karpo-decision's own ``DecisionConfig``, and
     refused (``ValueError``) when this module cannot answer with it: the global layers here read both ways and
@@ -374,7 +388,7 @@ class MLXDecider:
         self.path = Path(path)
         self.token_budget = token_budget
         self.max_length = max_length
-        metadata = json.loads((self.path / "mlx_config.json").read_text())
+        metadata = _metadata(self.path)
         self.bits: int = metadata["bits"]
         text = metadata["text_config"]
         arguments = _arguments(text)
@@ -388,6 +402,10 @@ class MLXDecider:
                 raise ValueError(f"code {code!r} is not token {token_id} of this tokenizer")
         self.encoder = Encoder(gemma.Processor(tokenizer, None), self.config.codes, template(self.config.template),
                                self.config.marker)
+        if self.config.readout_dtype not in READOUT_DTYPES:
+            raise ValueError(f"readout_dtype {self.config.readout_dtype!r} is not one of: {', '.join(READOUT_DTYPES)}")
+        if not (self.path / "readout.safetensors").is_file():
+            raise ValueError(f"{self.path} has no readout.safetensors")
         readout = mx.load(str(self.path / "readout.safetensors")).get("weight")
         if readout is None or readout.shape != (len(self.config.codes), arguments.hidden_size):
             found = "no weight" if readout is None else f"a weight of {readout.shape}"
