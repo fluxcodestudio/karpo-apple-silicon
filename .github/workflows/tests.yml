@@ -1,23 +1,34 @@
 # Copyright 2026 FluxCode Studio and the karpo-apple-silicon contributors
 # SPDX-License-Identifier: Apache-2.0
 name: Tests
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: read
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   tests:
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-15, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: machinepulse-ai/karpo-decision
           ref: c52d3507a254d3ad8423726c6bc6568c99113e7d
           path: upstream
-      - uses: actions/setup-python@v5
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
       - if: runner.os == 'Linux'
@@ -29,5 +40,17 @@ jobs:
       - run: python -m pip install -e ./upstream -e '.[dev,mlx]'
         if: runner.os == 'macOS'
       - run: python -m ruff check .
-      - run: python -m unittest discover -s tests -v
+      # A skipped test passes silently, so only the skips this runner cannot avoid are allowed: the hosted
+      # runners report no Apple GPU, and MLX does not exist for Linux.
+      - name: Unit tests, failing on an unexpected skip
+        env:
+          EXPECTED_SKIPS: ${{ runner.os == 'macOS' && 'MPS' || 'MPS|MLX|mlx' }}
+        run: |
+          python -m unittest discover -s tests -v 2>&1 | tee unittest.log
+          if grep -E "\.\.\. skipped" unittest.log | grep -v -E "$EXPECTED_SKIPS"; then
+            echo "::error::a test was skipped for a reason this runner should not have"
+            exit 1
+          fi
       - run: python scripts/check_upstream_suite.py upstream
+      - name: Build the source archive and the wheel
+        run: python -m build

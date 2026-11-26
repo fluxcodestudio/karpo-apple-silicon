@@ -23,24 +23,31 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 [project.urls]
 Homepage = "https://github.com/fluxcodestudio/karpo-apple-silicon"
+Repository = "https://github.com/fluxcodestudio/karpo-apple-silicon"
+Changelog = "https://github.com/fluxcodestudio/karpo-apple-silicon/blob/main/CHANGELOG.md"
 Issues = "https://github.com/fluxcodestudio/karpo-apple-silicon/issues"
 "Karpo Decision (upstream)" = "https://github.com/machinepulse-ai/karpo-decision"
 "Karpo Decision 31B weights" = "https://huggingface.co/MachinePulseAI/karpo-decision-31B"
 "Karpo Decision 12B weights" = "https://huggingface.co/MachinePulseAI/karpo-decision-12B"
 
 [project.optional-dependencies]
-mlx = ["mlx>=0.32", "mlx-lm>=0.32"]
-dev = ["pytest>=8", "ruff>=0.8"]
+# mlx.py builds on mlx-lm's Gemma 4 classes, which are not a stable interface: only the checked minor is allowed.
+# safetensors is what scripts/convert_mlx.py reads a checkpoint with.
+mlx = ["mlx>=0.32", "mlx-lm>=0.32,<0.33", "safetensors>=0.4"]
+dev = ["build>=1.2", "pytest>=8", "ruff>=0.17,<0.18"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+# A karpo-decision checkout, where CI and scripts/check_upstream_suite.py put one: not this project's code.
+extend-exclude = ["upstream"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
