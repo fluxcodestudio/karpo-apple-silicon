@@ -8,7 +8,17 @@ venv/
 .DS_Store
 .ruff_cache/
 .pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+uv.lock
+.env
+.idea/
+.vscode/
 .worktrees/
+
+# a karpo-decision checkout, as CI and scripts/check_upstream_suite.py use one
+upstream/
 *.pt
 *.npy
 comparison*.json
